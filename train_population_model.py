@@ -382,6 +382,11 @@ class PopulationLoss:
         err = x_sim[1:] - x_true[1:]
         mse_per_state = torch.mean(err ** 2, dim=(0, 1))
 
+        # Enforce MSE^{C_1} = 0 as per Section 2.2.1
+        mask = torch.ones_like(mse_per_state)
+        mask[self.c1_index] = 0.0
+        mse_per_state = mse_per_state * mask
+
         # state_min already holds every floor in SCALED space (C1's is set in main()).
         floor = self.state_min
         soft_constraint = torch.clamp(-(x_sim[1:] - floor), min=0.0)
