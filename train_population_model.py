@@ -12,24 +12,19 @@ EXPECTED INPUT FILE (written by merge_parts.py):
     dataset_glucose (N, T)      mg/dL
     N is a multiple of 5; every 5 consecutive rows = one meal pattern.
 
-WHAT CHANGED vs. the previous version
--------------------------------------
-1. RAM: the merged file can hold ~231k traces (~18 GB of states). Added
-   MAX_TRAIN_SCENARIOS / MAX_VAL_SCENARIOS, which cap how many traces are
-   loaded. The cap is applied on whole 5-trace GROUPS, so no meal pattern is
-   split. Without a cap the train buffer alone would need >11 GB.
+KEY FEATURES
+------------
+1. RAM: MAX_TRAIN_SCENARIOS / MAX_VAL_SCENARIOS cap how many traces are
+   loaded (whole 5-trace groups, so no meal pattern is split).
 2. Disk reads: for HDF5 (v7.3) files only the selected scenarios are read
-   (contiguous runs), instead of streaming the entire file once per split.
-3. RobustScaler is fit on a random subsample of rows (SCALER_FIT_ROWS)
-   instead of every row (fitting on ~100M+ rows is very slow and needs many
-   GB of temporary memory).
-4. Window index table stored as int32 (half the memory).
-5. Pickle files are closed properly.
-6. Sanity check that channel 0 of the states really is Q1 in mmol/kg
-   (Q1*18/0.16 should match dataset_glucose); warns if the file was not
-   produced by merge_parts.py (wrong state order would silently corrupt S1).
-7. INPUT_COLUMN_PERM knob in case your population model expects the input
-   columns in a different order than [u_I, u_carbs].
+   (contiguous runs).
+3. RobustScaler is fit on a random subsample of TRAIN rows.
+4. Sanity check that channel 0 of the states is Q1 in mmol/kg
+   (Q1*18/0.16 should match dataset_glucose).
+5. C1 non-negativity floor is raw 0 expressed in scaled space.
+6. LR decay (e^-0.1 per full pass, per the paper) is scaled to the capped
+   epoch size.
+7. INPUT_COLUMN_PERM knob if inputs must be reordered.
 """
 
 import os
@@ -58,7 +53,7 @@ from t1dsim_ai.utils.preprocess import scale_single_state, scale_inverse_Q1
 # CONFIG - EDIT THESE
 # ==============================================================================
 MERGED_MAT_PATH = r"C:\Users\pc\Downloads\population\population_development_dataset_merged.mat"
-OUTPUT_DIR = "models/PopulationModel/"
+OUTPUT_DIR = "models/PopulationModel/"     # tip: use a NEW folder, e.g. "models/PopulationModel_new/" (keep trailing /)
 MODEL_FILENAME = "population_model_trained.pt"
 WARM_START_CHECKPOINT = None
 
@@ -71,7 +66,11 @@ PATIENCE = 20            # must be < MAX_EPOCHS to ever trigger
 MAX_TRAIN_BATCHES_PER_EPOCH = 3000   # None = every window every epoch
 MAX_VAL_BATCHES_PER_EPOCH = 1000     # None = every window every epoch
 LR = 1e-3
-LR_DECAY_PER_EPOCH = np.exp(-0.1)
+LR_DECAY_PER_EPOCH = np.exp(-0.1)   # paper: x e^-0.1 per FULL pass over the training windows
+# Our "epoch" is only MAX_TRAIN_BATCHES_PER_EPOCH batches (a fraction of a full pass), so applying
+# e^-0.1 per capped epoch decays the LR ~10x too fast per unit of data seen (LR ~ 7e-6 by epoch 50).
+# True = scale the decay so it matches the paper's schedule per full pass.
+SCALE_LR_DECAY_TO_FULL_EPOCH = True
 WEIGHT_DECAY = 0.0
 ALPHA = 0.7
 BETA = 0.08
@@ -383,8 +382,8 @@ class PopulationLoss:
         err = x_sim[1:] - x_true[1:]
         mse_per_state = torch.mean(err ** 2, dim=(0, 1))
 
-        floor = self.state_min.clone()
-        floor[self.c1_index] = 0.0
+        # state_min already holds every floor in SCALED space (C1's is set in main()).
+        floor = self.state_min
         soft_constraint = torch.clamp(-(x_sim[1:] - floor), min=0.0)
         soft_penalty_per_state = torch.sum(soft_constraint, dim=(0, 1))
 
@@ -467,6 +466,10 @@ def main():
     u_val = u_val_flat.reshape(len(val_idx), T, n_inputs)
 
     state_min = x_train.reshape(-1, n_states).min(axis=0)
+    # C1 has no ground-truth minimum; its physical floor is raw 0 (carbs on board >= 0).
+    # In SCALED space raw 0 is (0 - center)/scale. It is NOT 0: scaled 0 equals the median,
+    # which would wrongly penalise every C1 value below the median (~half of all timesteps).
+    state_min[C1_INDEX] = (0.0 - scaler_states.center_[C1_INDEX]) / scaler_states.scale_[C1_INDEX]
 
     lim_inferior_scaled = scale_single_state(70, "Q1", OUTPUT_DIR)
     lim_superior_scaled = scale_single_state(250, "Q1", OUTPUT_DIR)
@@ -484,12 +487,11 @@ def main():
     loss_fn = PopulationLoss(STATE_WEIGHTS, state_min, C1_INDEX, alpha=ALPHA, beta=BETA).to(DEVICE)
 
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=lambda epoch: LR_DECAY_PER_EPOCH ** epoch)
 
     train_sampler = FramedWindowSampler(x_train, u_train, SEQ_LEN, OVERLAP, BATCH_SIZE, DEVICE, seed=SEED)
     val_sampler = FramedWindowSampler(x_val, u_val, SEQ_LEN, OVERLAP, BATCH_SIZE, DEVICE, seed=SEED + 1)
     iters_per_epoch = train_sampler.n_batches_per_epoch()
+    full_iters_per_epoch = iters_per_epoch   # one full pass over every training window
     val_batches_per_epoch = val_sampler.n_batches_per_epoch()
     print(f"Windows: train {len(train_sampler.pairs)} ({iters_per_epoch} batches), "
           f"val {len(val_sampler.pairs)} ({val_batches_per_epoch} batches) | hop={train_sampler.hop}")
@@ -498,6 +500,15 @@ def main():
     if MAX_VAL_BATCHES_PER_EPOCH is not None:
         val_batches_per_epoch = min(val_batches_per_epoch, MAX_VAL_BATCHES_PER_EPOCH)
     print(f"Using {iters_per_epoch} train / {val_batches_per_epoch} val batches per epoch.")
+
+    # Paper: LR x e^-0.1 per FULL pass over the training windows. Our capped "epoch" is only a fraction of that.
+    if SCALE_LR_DECAY_TO_FULL_EPOCH:
+        decay_per_epoch = LR_DECAY_PER_EPOCH ** (iters_per_epoch / full_iters_per_epoch)
+    else:
+        decay_per_epoch = LR_DECAY_PER_EPOCH
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_per_epoch)
+    print(f"LR decay per epoch: x{decay_per_epoch:.5f} "
+          f"(LR after {MAX_EPOCHS} epochs would be {LR * decay_per_epoch ** MAX_EPOCHS:.2e})")
 
     val_fixed_batches = val_sampler.get_fixed_subset(val_batches_per_epoch)
     print(f"Fixed validation subset: {len(val_fixed_batches)} batches, reused every epoch.")
