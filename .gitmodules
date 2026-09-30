@@ -1,0 +1,3 @@
+[submodule "T1DSim_AI"]
+	path = T1DSim_AI
+	url = https://github.com/mosqueralopez/T1DSim_AI.git
