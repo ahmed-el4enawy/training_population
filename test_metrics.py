@@ -1,36 +1,55 @@
 import numpy as np
-import scipy.stats as st
 from evaluate_population_model import window_outcomes_batch, paired_tost
 
 def test_metrics():
-    # Synthetic BG: 1 window, 4 points: [60, 100, 200, 300]
-    # n = 4
-    # f_bg = 1.509 * (np.log(bg) ** 1.084 - 5.381)
-    # f(60): 1.509 * (ln(60)^1.084 - 5.381) 
-    #   ln(60) = 4.0943, 4.0943^1.084 = 4.673, 4.673-5.381 = -0.708 * 1.509 = -1.068
-    #   r = 10 * f^2 = 11.41
-    # f(100): ln(100) = 4.605, 4.605^1.084 = 5.321, 5.321-5.381 = -0.06 * 1.509 = -0.09
-    #   r = 10 * (-0.09)^2 = 0.081
-    # f(200): ln(200) = 5.298, 5.298^1.084 = 6.195, 6.195-5.381 = 0.814 * 1.509 = 1.228
-    #   r = 10 * 1.228^2 = 15.08
-    # f(300): ln(300) = 5.703, 5.703^1.084 = 6.711, 6.711-5.381 = 1.33 * 1.509 = 2.00
-    #   r = 10 * 2.00^2 = 40.0
-    
-    # LBGI should be (11.41 + 0.081 + 0 + 0) / 4 = 2.87
-    # HBGI should be (0 + 0 + 15.08 + 40.0) / 4 = 13.77
-    bg = np.array([[60, 100, 200, 300]], dtype=np.float64)
+    # 1. TIR, TAR, TBR
+    # Synthetic BG bounds: 69, 70, 180, 181
+    bg = np.array([[69.0, 70.0, 180.0, 181.0]])
     out = window_outcomes_batch(bg)
-    print("Test Metrics:")
-    print(f"LBGI: {out['LBGI'][0]:.2f}")
-    print(f"HBGI: {out['HBGI'][0]:.2f}")
     
-    # Paired TOST test
-    sim = np.array([1, 2, 3, 4, 5])
-    actual = np.array([1, 2, 3, 4, 5])
-    # diff = 0, se = 1e-12, margin = 5, t = 5/1e-12 -> p_value = 0 (Equivalent)
-    res = paired_tost(sim, actual, 5.0)
-    print("TOST Test:")
-    print(res)
+    # 70 to 180 inclusive -> 2 out of 4 = 50%
+    assert np.isclose(out['TIR'][0], 50.0), f"TIR failed: {out['TIR'][0]}"
+    # < 70 -> 1 out of 4 = 25%
+    assert np.isclose(out['TBR'][0], 25.0), f"TBR failed: {out['TBR'][0]}"
+    # > 180 -> 1 out of 4 = 25%
+    assert np.isclose(out['TAR'][0], 25.0), f"TAR failed: {out['TAR'][0]}"
+    
+    # MG
+    expected_mg = (69 + 70 + 180 + 181) / 4.0
+    assert np.isclose(out['MG'][0], expected_mg), f"MG failed: {out['MG'][0]}"
+    
+    # 2. LBGI / HBGI
+    # bg = [60, 100, 200, 300]
+    # Hand-computed LBGI = 2.87, HBGI = 13.77
+    bg_risk = np.array([[60.0, 100.0, 200.0, 300.0]])
+    out_risk = window_outcomes_batch(bg_risk)
+    assert np.isclose(out_risk['LBGI'][0], 2.87, atol=0.1), f"LBGI failed: {out_risk['LBGI'][0]}"
+    assert np.isclose(out_risk['HBGI'][0], 13.77, atol=0.1), f"HBGI failed: {out_risk['HBGI'][0]}"
+
+def test_tost():
+    # 1. Clearly equivalent
+    # diff = 0, se = 0, mean_diff < margin -> p_value = 0.0, Equivalent = True
+    sim = np.array([100.0, 110.0, 120.0])
+    act = np.array([100.0, 110.0, 120.0])
+    res = paired_tost(sim, act, margin=5.0)
+    assert res[5] is True, "Identical arrays failed equivalence"
+    assert res[4] == 0.0, "p-value should be 0.0 for identical arrays"
+
+    # 2. Clearly non-equivalent (identical arrays but mean_diff > margin)
+    sim = np.array([110.0, 120.0, 130.0])
+    act = np.array([100.0, 110.0, 120.0])
+    # diff is 10 for all, mean_diff = 10. Margin = 5. Not equivalent.
+    res = paired_tost(sim, act, margin=5.0)
+    assert res[5] is False, "Arrays outside margin should not be equivalent"
+    assert res[4] == 1.0, "p-value should be 1.0 for completely outside"
+    
+    # 3. Small n (< 2)
+    sim = np.array([100.0])
+    act = np.array([100.0])
+    res = paired_tost(sim, act, margin=5.0)
+    assert res[5] is False, "n < 2 should fail equivalence"
 
 if __name__ == "__main__":
     test_metrics()
+    test_tost()
+    print("All tests passed.")

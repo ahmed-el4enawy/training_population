@@ -37,10 +37,10 @@ WARM_START_CHECKPOINT = None
 
 # [PAPER-EXPLICIT]
 SEQ_LEN = 61
-OVERLAP = 0.75
+TRAIN_OVERLAP = 0.75
 BATCH_SIZE = 128
 LR = 1e-3
-WEIGHT_DECAY = 0.0
+WEIGHT_DECAY = 0.0 # [OFFICIAL-CODE-DERIVED]
 ALPHA = 0.7
 BETA = 0.08
 # Paper says e^-0.1 per epoch, which we apply after every FULL pass.
@@ -52,6 +52,8 @@ LR_DECAY_PER_EPOCH = np.exp(-0.1)
 # Set these manually before running training.
 MAX_EPOCHS = None
 PATIENCE = None
+VAL_OVERLAP = None
+CHECKPOINT_POLICY = None # "final_epoch" or "best_validation"
 
 # [ENGINEERING] (Memory management limits)
 # If RAM is insufficient to load all data or fit scalers, these cap the usage.
@@ -67,7 +69,7 @@ INPUT_COLUMN_PERM = None
 STATE_ORDER = ["Q1", "Q2", "S1", "S2", "I", "X1", "X2", "X3", "C2", "C1"]
 C1_INDEX = STATE_ORDER.index("C1")
 
-# [PAPER-EXPLICIT]
+# [RECONSTRUCTION] Exact rational fractions recreating paper's rounded decimals
 STATE_WEIGHTS = np.array(
     [5/24, 1/6, 1/12, 1/12, 1/12, 1/12, 1/12, 1/12, 1/12, 1/24],
     dtype=np.float32,
@@ -105,7 +107,7 @@ def _check_q1_channel(states_chunk, glucose_chunk):
     implied = states_chunk[..., 0] * _MGDL_PER_MMOL / _VDG
     err = float(np.abs(implied - glucose_chunk).max())
     if err > 1.0:
-        print(f"  WARNING: channel 0 does not match Q1 (max diff {err:.1f} mg/dL).")
+        raise RuntimeError(f"Strict mode failure: channel 0 does not match Q1 (max diff {err:.1f} mg/dL).")
 
 def fill_split_buffer(path, idx, T, n_states, n_inputs, chunk_size=CHUNK_SCENARIOS):
     idx = np.asarray(idx)
@@ -287,6 +289,10 @@ def main():
 
     if MAX_EPOCHS is None:
         raise ValueError("MAX_EPOCHS is explicitly [UNRESOLVED] and must be configured manually before training.")
+    if CHECKPOINT_POLICY not in ["best_validation", "final_epoch"]:
+        raise ValueError("CHECKPOINT_POLICY must be configured as 'best_validation' or 'final_epoch'.")
+    if VAL_OVERLAP is None:
+        raise ValueError("VAL_OVERLAP must be configured manually before training.")
     print(f"Inspecting merged dataset at: {MERGED_MAT_PATH}")
     t0 = time.time()
     n_scenarios, T, n_states, n_inputs = get_dataset_dims(MERGED_MAT_PATH)
@@ -365,8 +371,8 @@ def main():
 
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
-    train_sampler = FramedWindowSampler(x_train, u_train, SEQ_LEN, OVERLAP, BATCH_SIZE, DEVICE, seed=SEED)
-    val_sampler = FramedWindowSampler(x_val, u_val, SEQ_LEN, OVERLAP, BATCH_SIZE, DEVICE, seed=SEED + 1)
+    train_sampler = FramedWindowSampler(x_train, u_train, SEQ_LEN, TRAIN_OVERLAP, BATCH_SIZE, DEVICE, seed=SEED)
+    val_sampler = FramedWindowSampler(x_val, u_val, SEQ_LEN, VAL_OVERLAP, BATCH_SIZE, DEVICE, seed=SEED + 1)
     
     iters_per_epoch = train_sampler.n_batches_per_epoch()
     val_batches_per_epoch = val_sampler.n_batches_per_epoch()
@@ -384,6 +390,10 @@ def main():
     print(f"Timing probe: {WARMUP_BATCHES} batches (non-mutating) ...")
     model.eval()
     t_probe = time.time()
+    probe_pos = train_sampler.pos
+    probe_epoch_order = train_sampler.epoch_order.copy()
+    probe_rng_state = train_sampler.rng.get_state()
+    
     with torch.no_grad():
         for _ in range(WARMUP_BATCHES):
             x0, u_batch, x_true = train_sampler.next_batch()
@@ -391,6 +401,11 @@ def main():
             loss_fn(x_sim, x_true, lim_inferior_scaled, lim_superior_scaled)
     if DEVICE.type == "cuda":
         torch.cuda.synchronize()
+        
+    train_sampler.rng.set_state(probe_rng_state)
+    train_sampler.epoch_order = probe_epoch_order
+    train_sampler.pos = probe_pos
+    
     sec_per_batch = (time.time() - t_probe) / max(1, WARMUP_BATCHES)
     print(f"  {sec_per_batch:.3f} s/batch")
 
@@ -398,6 +413,9 @@ def main():
     best_val_loss = float("inf")
     epochs_without_improvement = 0
     skipped_total = 0
+    nonfinite_sim_batches = 0
+    nonfinite_loss_batches = 0
+    nonfinite_grad_batches = 0
 
     for epoch in range(1, MAX_EPOCHS + 1):
         model.train()
@@ -411,10 +429,16 @@ def main():
             x_sim = simulator(x0, u_batch)
 
             if torch.isnan(x_sim).any() or torch.isinf(x_sim).any():
+                nonfinite_sim_batches += 1
                 skipped_total += 1
                 continue
 
             loss, _, _ = loss_fn(x_sim, x_true, lim_inferior_scaled, lim_superior_scaled)
+            if not torch.isfinite(loss):
+                nonfinite_loss_batches += 1
+                skipped_total += 1
+                continue
+                
             loss.backward()
             
             # NaN gradient safety
@@ -425,6 +449,7 @@ def main():
                     break
             
             if grad_is_nan:
+                nonfinite_grad_batches += 1
                 skipped_total += 1
                 optimizer.zero_grad()
                 continue
@@ -469,15 +494,20 @@ def main():
         if mean_val_loss < best_val_loss:
             best_val_loss = mean_val_loss
             epochs_without_improvement = 0
-            torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, MODEL_FILENAME))
-            print(f"  -> new best val_loss, saved to {os.path.join(OUTPUT_DIR, MODEL_FILENAME)}")
+            if CHECKPOINT_POLICY == "best_validation":
+                torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, MODEL_FILENAME))
+                print(f"  -> new best val_loss, saved to {os.path.join(OUTPUT_DIR, MODEL_FILENAME)}")
         else:
             epochs_without_improvement += 1
-            if epochs_without_improvement >= PATIENCE:
+            if PATIENCE is not None and epochs_without_improvement >= PATIENCE:
                 print(f"Early stopping after {epochs_without_improvement} epochs.")
                 break
+                
+        if CHECKPOINT_POLICY == "final_epoch":
+            torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, MODEL_FILENAME))
+            print(f"  -> saved final_epoch checkpoint to {os.path.join(OUTPUT_DIR, MODEL_FILENAME)}")
 
-    print(f"Training complete. Skipped {skipped_total} NaN/Inf batches.")
+    print(f"Training complete. Skipped {skipped_total} NaN/Inf batches (Sim: {nonfinite_sim_batches}, Loss: {nonfinite_loss_batches}, Grad: {nonfinite_grad_batches}).")
 
 if __name__ == "__main__":
     main()

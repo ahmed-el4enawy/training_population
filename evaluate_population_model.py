@@ -1,10 +1,8 @@
 """
 eval_population_model.py  (fixed version)
 
-Evaluates the trained population NN model on the held-out TEST split and
-reproduces the population-level rows of Table 3 (arXiv:2508.05705):
-per-5-hour-window TIR/TAR/TBR/LBGI/HBGI/MG for simulated vs. actual, with
-paired TOST equivalence tests.
+Evaluates the trained population NN model on the held-out simulated DP_test split
+using the paper's 5-hour glucose outcome metrics and TOST methodology.
 
 Run after train_population_model.py (same folder, same OUTPUT_DIR).
 """
@@ -39,6 +37,9 @@ from train_population_model import (
 # ==============================================================================
 EVAL_BATCH_SIZE = 256
 MAX_TEST_SCENARIOS = None   # Evaluate on full TEST split
+# [UNRESOLVED] Final population test window overlap/stride.
+# Zero overlap means adjacent windows step by 60 intervals (sharing the boundary state).
+TEST_OVERLAP = None
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 TIR_LOW, TIR_HIGH = 70.0, 180.0
@@ -67,9 +68,17 @@ def window_outcomes_batch(bg):
 def paired_tost(sim, actual, margin, alpha=ALPHA):
     diff = sim - actual
     n = len(diff)
+    if n < 2:
+        return (float('nan'), float('nan'), float('nan'), float('nan'), 1.0, False)
+        
     mean_diff = diff.mean()
     se = diff.std(ddof=1) / np.sqrt(n)
-    if se == 0: se = 1e-12
+    
+    if se == 0:
+        p_value = 0.0 if abs(mean_diff) < margin else 1.0
+        return (sim.mean(), sim.std(ddof=1) if n >= 2 else 0.0, 
+                actual.mean(), actual.std(ddof=1) if n >= 2 else 0.0,
+                p_value, p_value < alpha)
 
     t1 = (mean_diff + margin) / se
     p1 = 1 - st.t.cdf(t1, df=n - 1)
@@ -120,9 +129,11 @@ def main():
     # Note: no CGM clamp in evaluation per strict adherence.
     simulator = ForwardEulerSimulatorPop(model, ts=5.0).to(DEVICE)
 
-    # Non-overlapping windows for evaluation
+    if TEST_OVERLAP is None:
+        raise ValueError("TEST_OVERLAP must be configured manually before evaluation.")
+
     sampler = FramedWindowSampler(
-        x_test, u_test, SEQ_LEN, overlap=0.0, batch_size=EVAL_BATCH_SIZE,
+        x_test, u_test, SEQ_LEN, overlap=TEST_OVERLAP, batch_size=EVAL_BATCH_SIZE,
         device=DEVICE, seed=SEED,
     )
     all_pairs = sampler.pairs
