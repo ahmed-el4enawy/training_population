@@ -39,7 +39,7 @@ EVAL_BATCH_SIZE = 256
 MAX_TEST_SCENARIOS = None   # Evaluate on full TEST split
 # [UNRESOLVED] Final population test window overlap/stride.
 # Zero overlap means adjacent windows step by 60 intervals (sharing the boundary state).
-TEST_OVERLAP = None
+TEST_OVERLAP = 0.0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 TIR_LOW, TIR_HIGH = 70.0, 180.0
@@ -153,11 +153,16 @@ def main():
             y_sim = scale_inverse_Q1(x_sim[:, :, [0]].cpu().numpy(), OUTPUT_DIR)[..., 0].T    # (q, m)
             y_true = scale_inverse_Q1(x_true[:, :, [0]].cpu().numpy(), OUTPUT_DIR)[..., 0].T  # (q, m)
 
-            valid = np.isfinite(y_sim).all(axis=1) & np.isfinite(y_true).all(axis=1)
-            n_skipped += int((~valid).sum())
-            if not valid.any(): continue
-            
-            y_sim, y_true = y_sim[valid], y_true[valid]
+            if not np.isfinite(y_sim).all():
+                raise RuntimeError(
+                    "Non-finite population-model output detected during final test evaluation."
+                )
+
+            if not np.isfinite(y_true).all():
+                raise RuntimeError(
+                    "Non-finite ground-truth values detected in final test evaluation."
+                )
+
             sim_out = window_outcomes_batch(y_sim)
             act_out = window_outcomes_batch(y_true)
             
