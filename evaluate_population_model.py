@@ -58,8 +58,9 @@ def window_outcomes_batch(bg):
     r_bg = 10.0 * f_bg ** 2
     neg = f_bg < 0
     pos = ~neg
-    lbgi = np.where(neg.any(axis=1), (r_bg * neg).sum(axis=1) / np.maximum(neg.sum(axis=1), 1), 0.0)
-    hbgi = np.where(pos.any(axis=1), (r_bg * pos).sum(axis=1) / np.maximum(pos.sum(axis=1), 1), 0.0)
+    n = bg.shape[1]
+    lbgi = (r_bg * neg).sum(axis=1) / n
+    hbgi = (r_bg * pos).sum(axis=1) / n
 
     return {"TIR": tir, "TAR": tar, "TBR": tbr, "LBGI": lbgi, "HBGI": hbgi, "MG": bg.mean(axis=1)}
 

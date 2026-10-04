@@ -47,9 +47,11 @@ BETA = 0.08
 LR_DECAY_PER_EPOCH = np.exp(-0.1)
 
 # [UNRESOLVED]
-# The paper states 150 epochs for the individual model, but population epoch count is omitted.
-MAX_EPOCHS = 150 
-PATIENCE = 20    
+# The paper explicitly provides 150 epochs for individual models, but omits the population count.
+# Official artifact analysis shows "epoch_15" checkpoints.
+# Set these manually before running training.
+MAX_EPOCHS = None
+PATIENCE = None
 
 # [ENGINEERING] (Memory management limits)
 # If RAM is insufficient to load all data or fit scalers, these cap the usage.
@@ -283,6 +285,8 @@ def main():
     torch.manual_seed(SEED)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    if MAX_EPOCHS is None:
+        raise ValueError("MAX_EPOCHS is explicitly [UNRESOLVED] and must be configured manually before training.")
     print(f"Inspecting merged dataset at: {MERGED_MAT_PATH}")
     t0 = time.time()
     n_scenarios, T, n_states, n_inputs = get_dataset_dims(MERGED_MAT_PATH)
