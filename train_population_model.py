@@ -35,6 +35,9 @@ OUTPUT_DIR = "models/PopulationModel_v2/"
 MODEL_FILENAME = "population_model_trained.pt"
 WARM_START_CHECKPOINT = None
 
+# [ENGINEERING / REPRODUCIBILITY]
+SEED = 0
+
 # [PAPER-EXPLICIT]
 SEQ_LEN = 61
 TRAIN_OVERLAP = 0.75
@@ -46,14 +49,17 @@ BETA = 0.08
 # Paper says e^-0.1 per epoch, which we apply after every FULL pass.
 LR_DECAY_PER_EPOCH = np.exp(-0.1)
 
-# [UNRESOLVED]
+# [UNRESOLVED] -> Resolved for Final Run
 # The paper explicitly provides 150 epochs for individual models, but omits the population count.
 # Official artifact analysis shows "epoch_15" checkpoints.
-# Set these manually before running training.
-MAX_EPOCHS = None
+# [OFFICIAL-ARTIFACT-DERIVED / RECONSTRUCTION]
+MAX_EPOCHS = 15
+# [RECONSTRUCTION] Reason: paper does not describe population early stopping.
 PATIENCE = None
-VAL_OVERLAP = None
-CHECKPOINT_POLICY = None # "final_epoch" or "best_validation"
+# [RECONSTRUCTION] Reason: the only explicitly described validation framing in the paper is 5-hour sequences with no overlap during Bayesian architecture optimization.
+VAL_OVERLAP = 0.0
+# [RECONSTRUCTION] Reason: Algorithm 1 trains for n_epochs and returns the optimized final parameters; the paper does not specify best-validation checkpoint selection.
+CHECKPOINT_POLICY = "final_epoch"
 
 # [ENGINEERING] (Memory management limits)
 # If RAM is insufficient to load all data or fit scalers, these cap the usage.
@@ -316,14 +322,21 @@ def main():
 
     print("Fitting RobustScaler on TRAIN ...")
     n_rows = x_train_flat.shape[0]
-    rng_fit = np.random.RandomState(SEED)
-    if SCALER_FIT_ROWS and n_rows > SCALER_FIT_ROWS:
-        fit_rows = np.sort(rng_fit.choice(n_rows, SCALER_FIT_ROWS, replace=False))
+    if SCALER_FIT_ROWS is None:
+        scaler_states = RobustScaler().fit(x_train_flat)
+        scaler_inputs = RobustScaler().fit(u_train_flat)
     else:
-        fit_rows = np.arange(n_rows)
-    scaler_states = RobustScaler().fit(x_train_flat[fit_rows])
-    scaler_inputs = RobustScaler().fit(u_train_flat[fit_rows])
-    del fit_rows
+        rng_fit = np.random.RandomState(SEED)
+        fit_rows = np.sort(
+            rng_fit.choice(
+                n_rows,
+                min(SCALER_FIT_ROWS, n_rows),
+                replace=False
+            )
+        )
+        scaler_states = RobustScaler().fit(x_train_flat[fit_rows])
+        scaler_inputs = RobustScaler().fit(u_train_flat[fit_rows])
+        del fit_rows
 
     with open(os.path.join(OUTPUT_DIR, "scaler_states.pkl"), "wb") as fh:
         dump(scaler_states, fh)
@@ -409,13 +422,8 @@ def main():
     sec_per_batch = (time.time() - t_probe) / max(1, WARMUP_BATCHES)
     print(f"  {sec_per_batch:.3f} s/batch")
 
-    train_sampler._reshuffle()
     best_val_loss = float("inf")
     epochs_without_improvement = 0
-    skipped_total = 0
-    nonfinite_sim_batches = 0
-    nonfinite_loss_batches = 0
-    nonfinite_grad_batches = 0
 
     for epoch in range(1, MAX_EPOCHS + 1):
         model.train()
@@ -428,31 +436,19 @@ def main():
             x0, u_batch, x_true = train_sampler.next_batch()
             x_sim = simulator(x0, u_batch)
 
-            if torch.isnan(x_sim).any() or torch.isinf(x_sim).any():
-                nonfinite_sim_batches += 1
-                skipped_total += 1
-                continue
+            if not torch.isfinite(x_sim).all():
+                raise RuntimeError("Non-finite simulation detected during final training.")
 
             loss, _, _ = loss_fn(x_sim, x_true, lim_inferior_scaled, lim_superior_scaled)
             if not torch.isfinite(loss):
-                nonfinite_loss_batches += 1
-                skipped_total += 1
-                continue
+                raise RuntimeError("Non-finite loss detected during final training.")
                 
             loss.backward()
             
             # NaN gradient safety
-            grad_is_nan = False
             for p in model.parameters():
-                if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
-                    grad_is_nan = True
-                    break
-            
-            if grad_is_nan:
-                nonfinite_grad_batches += 1
-                skipped_total += 1
-                optimizer.zero_grad()
-                continue
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    raise RuntimeError("Non-finite gradient detected during final training.")
                 
             optimizer.step()
             epoch_losses.append(loss.item())
@@ -507,7 +503,7 @@ def main():
             torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, MODEL_FILENAME))
             print(f"  -> saved final_epoch checkpoint to {os.path.join(OUTPUT_DIR, MODEL_FILENAME)}")
 
-    print(f"Training complete. Skipped {skipped_total} NaN/Inf batches (Sim: {nonfinite_sim_batches}, Loss: {nonfinite_loss_batches}, Grad: {nonfinite_grad_batches}).")
+    print(f"Training complete.")
 
 if __name__ == "__main__":
     main()
