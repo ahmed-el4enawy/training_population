@@ -22,6 +22,7 @@ import torch.optim as optim
 from pickle import dump
 import h5py
 from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing._data import _handle_zeros_in_scale
 
 from t1dsim_ai.population_model import CGMOHSUSimStateSpaceModel_V2
 from t1dsim_ai.options import n_neurons_pop
@@ -30,7 +31,8 @@ from t1dsim_ai.utils.preprocess import scale_single_state, scale_inverse_Q1
 # ==============================================================================
 # CONFIG - EDIT THESE
 # ==============================================================================
-MERGED_MAT_PATH = r"C:\Users\pc\Downloads\population\population_development_dataset_merged.mat"
+MERGED_MAT_PATH = r"F:\College\Graduation Project\Dataset\population_development_dataset_merged.mat"
+CACHE_DIR = r"E:\population_training_cache"
 OUTPUT_DIR = "models/PopulationModel_v2/"     
 MODEL_FILENAME = "population_model_trained.pt"
 WARM_START_CHECKPOINT = None
@@ -115,13 +117,22 @@ def _check_q1_channel(states_chunk, glucose_chunk):
     if err > 1.0:
         raise RuntimeError(f"Strict mode failure: channel 0 does not match Q1 (max diff {err:.1f} mg/dL).")
 
-def fill_split_buffer(path, idx, T, n_states, n_inputs, chunk_size=CHUNK_SCENARIOS):
+def fill_split_buffer_memmap(path, idx, T, n_states, n_inputs, prefix, chunk_size=2000):
     idx = np.asarray(idx)
-    x_flat = np.empty((len(idx) * T, n_states), dtype=np.float32)
-    u_flat = np.empty((len(idx) * T, n_inputs), dtype=np.float32)
-
+    total_rows = len(idx) * T
+    
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    x_path = os.path.join(CACHE_DIR, f"{prefix}_states.dat")
+    u_path = os.path.join(CACHE_DIR, f"{prefix}_inputs.dat")
+    
+    x_flat = np.memmap(x_path, dtype=np.float32, mode='w+', shape=(total_rows, n_states))
+    u_flat = np.memmap(u_path, dtype=np.float32, mode='w+', shape=(total_rows, n_inputs))
+    
     runs = np.split(idx, np.where(np.diff(idx) != 1)[0] + 1)
     pos = 0
+    total_scenarios = len(idx)
+    scenarios_loaded = 0
+    
     with h5py.File(path, "r") as f:
         ds_s, ds_i, ds_g = f["dataset_states"], f["dataset_inputs"], f["dataset_glucose"]
         for run in runs:
@@ -137,13 +148,54 @@ def fill_split_buffer(path, idx, T, n_states, n_inputs, chunk_size=CHUNK_SCENARI
                 x_flat[pos * T:(pos + c) * T] = st.reshape(c * T, n_states)
                 u_flat[pos * T:(pos + c) * T] = ip.reshape(c * T, n_inputs)
                 pos += c
+                scenarios_loaded += c
+                pct = int(scenarios_loaded / total_scenarios * 100)
+                if pct % 5 == 0 and scenarios_loaded == c or (scenarios_loaded % (chunk_size*5) < chunk_size):
+                    print(f"{prefix} cache: {pct}%", flush=True)
+
+    x_flat.flush()
+    u_flat.flush()
     return x_flat, u_flat
 
-def transform_in_place(scaler, flat_array, chunk_rows=500_000):
-    n = flat_array.shape[0]
+def fit_robust_scaler_memmap(memmap_array):
+    n_rows, n_features = memmap_array.shape
+    centers = np.zeros(n_features, dtype=np.float64)
+    scales = np.zeros(n_features, dtype=np.float64)
+    
+    for i in range(n_features):
+        col = memmap_array[:, i]
+        q25, median, q75 = np.percentile(col, [25.0, 50.0, 75.0])
+        iqr = q75 - q25
+        centers[i] = median
+        scales[i] = iqr
+        
+    scales = _handle_zeros_in_scale(scales, copy=False)
+    
+    scaler = RobustScaler()
+    scaler.center_ = centers
+    scaler.scale_ = scales
+    scaler.n_features_in_ = n_features
+    return scaler
+
+def compute_state_min_memmap(memmap_array, n_states, chunk_rows=500_000):
+    n = memmap_array.shape[0]
+    global_min = np.full(n_states, np.inf, dtype=np.float32)
     for start in range(0, n, chunk_rows):
         end = min(start + chunk_rows, n)
-        flat_array[start:end] = scaler.transform(flat_array[start:end]).astype(np.float32)
+        chunk_min = memmap_array[start:end].min(axis=0)
+        global_min = np.minimum(global_min, chunk_min)
+    return global_min
+
+def transform_in_place_memmap(scaler, memmap_array, prefix, name, chunk_rows=500_000):
+    n = memmap_array.shape[0]
+    for start in range(0, n, chunk_rows):
+        end = min(start + chunk_rows, n)
+        memmap_array[start:end] = scaler.transform(memmap_array[start:end]).astype(np.float32)
+        pct = int(end / n * 100)
+        if (start // chunk_rows) % max(1, (n // chunk_rows // 20)) == 0:
+            print(f"Scaling {prefix} {name}: {pct}%", flush=True)
+    memmap_array.flush()
+    print(f"Scaling {prefix} {name}: 100%", flush=True)
 
 # ==============================================================================
 # Framed batch sampler (true 75% overlap, index pairs only)
@@ -315,28 +367,18 @@ def main():
 
     print(f"Loading TRAIN scenarios ...")
     t0 = time.time()
-    x_train_flat, u_train_flat = fill_split_buffer(MERGED_MAT_PATH, train_idx, T, n_states, n_inputs)
+    x_train_flat, u_train_flat = fill_split_buffer_memmap(MERGED_MAT_PATH, train_idx, T, n_states, n_inputs, prefix="TRAIN")
     if INPUT_COLUMN_PERM is not None:
-        u_train_flat = np.ascontiguousarray(u_train_flat[:, INPUT_COLUMN_PERM])
+        raise NotImplementedError("INPUT_COLUMN_PERM not implemented for memmap refactor.")
     print(f"  done in {time.time()-t0:.1f}s")
 
     print("Fitting RobustScaler on TRAIN ...")
     n_rows = x_train_flat.shape[0]
-    if SCALER_FIT_ROWS is None:
-        scaler_states = RobustScaler().fit(x_train_flat)
-        scaler_inputs = RobustScaler().fit(u_train_flat)
-    else:
-        rng_fit = np.random.RandomState(SEED)
-        fit_rows = np.sort(
-            rng_fit.choice(
-                n_rows,
-                min(SCALER_FIT_ROWS, n_rows),
-                replace=False
-            )
-        )
-        scaler_states = RobustScaler().fit(x_train_flat[fit_rows])
-        scaler_inputs = RobustScaler().fit(u_train_flat[fit_rows])
-        del fit_rows
+    if SCALER_FIT_ROWS is not None:
+        raise ValueError("SCALER_FIT_ROWS must be None to fit scaler on all train data in memmap mode.")
+        
+    scaler_states = fit_robust_scaler_memmap(x_train_flat)
+    scaler_inputs = fit_robust_scaler_memmap(u_train_flat)
 
     with open(os.path.join(OUTPUT_DIR, "scaler_states.pkl"), "wb") as fh:
         dump(scaler_states, fh)
@@ -345,23 +387,21 @@ def main():
     print(f"  saved scalers to {OUTPUT_DIR}")
 
     print("Scaling TRAIN in place ...")
-    transform_in_place(scaler_states, x_train_flat)
-    transform_in_place(scaler_inputs, u_train_flat)
+    transform_in_place_memmap(scaler_states, x_train_flat, "TRAIN", "states")
+    transform_in_place_memmap(scaler_inputs, u_train_flat, "TRAIN", "inputs")
     x_train = x_train_flat.reshape(len(train_idx), T, n_states)
     u_train = u_train_flat.reshape(len(train_idx), T, n_inputs)
 
     print(f"Loading VAL scenarios ...")
-    x_val_flat, u_val_flat = fill_split_buffer(MERGED_MAT_PATH, val_idx, T, n_states, n_inputs)
-    if INPUT_COLUMN_PERM is not None:
-        u_val_flat = np.ascontiguousarray(u_val_flat[:, INPUT_COLUMN_PERM])
+    x_val_flat, u_val_flat = fill_split_buffer_memmap(MERGED_MAT_PATH, val_idx, T, n_states, n_inputs, prefix="VAL")
 
     print("Scaling VAL in place ...")
-    transform_in_place(scaler_states, x_val_flat)
-    transform_in_place(scaler_inputs, u_val_flat)
+    transform_in_place_memmap(scaler_states, x_val_flat, "VAL", "states")
+    transform_in_place_memmap(scaler_inputs, u_val_flat, "VAL", "inputs")
     x_val = x_val_flat.reshape(len(val_idx), T, n_states)
     u_val = u_val_flat.reshape(len(val_idx), T, n_inputs)
 
-    state_min = x_train.reshape(-1, n_states).min(axis=0)
+    state_min = compute_state_min_memmap(x_train_flat, n_states)
     state_min[C1_INDEX] = (0.0 - scaler_states.center_[C1_INDEX]) / scaler_states.scale_[C1_INDEX]
 
     lim_inferior_scaled = scale_single_state(70, "Q1", OUTPUT_DIR)
@@ -455,8 +495,10 @@ def main():
 
             if (it + 1) % print_every == 0 or (it + 1) == iters_per_epoch:
                 running_mean = np.mean(epoch_losses) if epoch_losses else float("nan")
+                elapsed = time.time() - t_epoch
+                eta = elapsed / (it + 1) * iters_per_epoch
                 print(f"  epoch {epoch} [train {it+1}/{iters_per_epoch}] "
-                      f"loss {running_mean:.6f} | {time.time()-t_epoch:.1f}s")
+                      f"loss {running_mean:.6f} | elapsed {elapsed:.1f}s | estimated epoch training time {eta:.1f}s")
 
         scheduler.step()
         model.eval()
