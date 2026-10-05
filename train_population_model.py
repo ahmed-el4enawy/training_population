@@ -31,8 +31,8 @@ from t1dsim_ai.utils.preprocess import scale_single_state, scale_inverse_Q1
 # ==============================================================================
 # CONFIG - EDIT THESE
 # ==============================================================================
-MERGED_MAT_PATH = r"F:\College\Graduation Project\Dataset\population_development_dataset_merged.mat"
-CACHE_DIR = r"E:\population_training_cache"
+MERGED_MAT_PATH = r"E:\T1D_population_training\population_development_dataset_merged.mat"
+CACHE_DIR = r"E:\T1D_population_training\cache"
 OUTPUT_DIR = "models/PopulationModel_v2/"     
 MODEL_FILENAME = "population_model_trained.pt"
 WARM_START_CHECKPOINT = None
