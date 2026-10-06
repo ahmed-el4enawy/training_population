@@ -52,3 +52,30 @@ pip install -e ./T1DSim_AI
    ```bash
    python evaluate_population_model.py
    ```
+
+## MOHESR HPC Usage
+
+The repository is configured for the MOHESR HPC gpu5 partition.
+
+### Paths
+- **Dataset**: /tmp/cugp012/population_development_dataset_merged.mat
+- **Cache**: /tmp/cugp012/cache
+- **Outputs**: /nfs/slurm/cugp012/training_population/models/PopulationModel_v2/
+
+### Benchmark Run
+To accurately measure the real forward/backward timing per batch without updating the optimizer:
+`ash
+sbatch hpc_benchmark.sh
+``n
+### Fresh Production Run
+To start the full 15-epoch population training from scratch:
+`ash
+sbatch hpc_train.sh
+``n
+### Resumed Production Run
+To safely resume training from the exact state saved at the last completed epoch boundary:
+`ash
+sbatch --export=ALL,RESUME_CHECKPOINT=/nfs/slurm/cugp012/training_population/models/PopulationModel_v2/training_state_latest.pt hpc_train.sh
+``n
+### Slurm Logs
+Logs are saved as ench_%j.out, ench_%j.err, 	rain_%j.out, 	rain_%j.err in the repository root.

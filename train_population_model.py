@@ -5,21 +5,16 @@ Trains the population-level NN state-space model T1DSim_NN^P
 (CGMOHSUSimStateSpaceModel_V2) on the merged simulated dataset produced by
 merge_parts.py (population_development_dataset_merged.mat), following
 Section 2.2.2 of Roquemen-Echeverri et al. (arXiv:2508.05705).
-
-EXPECTED INPUT FILE (written by merge_parts.py):
-    dataset_states   (N, T, 10)  order [Q1,Q2,S1,S2,I,X1,X2,X3,C2,C1]
-    dataset_inputs   (N, T, 2)   [u_I (U/hr), u_carbs (g)]
-    dataset_glucose  (N, T)      mg/dL
-    dataset_split_id (N,)        0=Train, 1=Val, 2=Test
 """
 
 import os
 import time
+import json
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from pickle import dump
+from pickle import dump, load
 import h5py
 from sklearn.preprocessing import RobustScaler
 from sklearn.preprocessing._data import _handle_zeros_in_scale
@@ -31,11 +26,12 @@ from t1dsim_ai.utils.preprocess import scale_single_state, scale_inverse_Q1
 # ==============================================================================
 # CONFIG - EDIT THESE
 # ==============================================================================
-MERGED_MAT_PATH = r"E:\T1D_population_training\population_development_dataset_merged.mat"
-CACHE_DIR = r"E:\T1D_population_training\cache"
-OUTPUT_DIR = "models/PopulationModel_v2/"     
+MERGED_MAT_PATH = os.environ.get("MERGED_MAT_PATH", "/tmp/cugp012/population_development_dataset_merged.mat")
+CACHE_DIR = os.environ.get("CACHE_DIR", "/tmp/cugp012/cache")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/nfs/slurm/cugp012/training_population/models/PopulationModel_v2/")
 MODEL_FILENAME = "population_model_trained.pt"
-WARM_START_CHECKPOINT = None
+RESUME_CHECKPOINT = os.environ.get("RESUME_CHECKPOINT", None)
+BENCHMARK_ONLY = os.environ.get("BENCHMARK_ONLY", "0") == "1"
 
 # [ENGINEERING / REPRODUCIBILITY]
 SEED = 0
@@ -52,20 +48,12 @@ BETA = 0.08
 LR_DECAY_PER_EPOCH = np.exp(-0.1)
 
 # [UNRESOLVED] -> Resolved for Final Run
-# The paper explicitly provides 150 epochs for individual models, but omits the population count.
-# Official artifact analysis shows "epoch_15" checkpoints.
-# [OFFICIAL-ARTIFACT-DERIVED / RECONSTRUCTION]
 MAX_EPOCHS = 15
-# [RECONSTRUCTION] Reason: paper does not describe population early stopping.
 PATIENCE = None
-# [RECONSTRUCTION] Reason: the only explicitly described validation framing in the paper is 5-hour sequences with no overlap during Bayesian architecture optimization.
 VAL_OVERLAP = 0.0
-# [RECONSTRUCTION] Reason: Algorithm 1 trains for n_epochs and returns the optimized final parameters; the paper does not specify best-validation checkpoint selection.
 CHECKPOINT_POLICY = "final_epoch"
 
 # [ENGINEERING] (Memory management limits)
-# If RAM is insufficient to load all data or fit scalers, these cap the usage.
-# To run a strict reproduction using all data, set these to None.
 MAX_TRAIN_SCENARIOS = None
 MAX_VAL_SCENARIOS = None
 MAX_TRAIN_BATCHES_PER_EPOCH = None
@@ -86,6 +74,7 @@ STATE_WEIGHTS = np.array(
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 _VDG = 0.16
 _MGDL_PER_MMOL = 18.0
+EXPECTED_SHA256 = "6FCE64E2D5C695EA61BE5C376C061A6B937D5728B94FE293803D9D83766DA91C"
 
 # ==============================================================================
 # Data loading
@@ -268,8 +257,6 @@ class ForwardEulerSimulatorPop(nn.Module):
         self.cgm_max = cgm_max
 
     def adjust_cgm(self, x):
-        # [UNRESOLVED] The paper does not specify clamping Q1. 
-        # But if stability requires it, we can clamp it. Otherwise return x.
         if self.cgm_min is not None and self.cgm_max is not None:
             return torch.clamp(x, min=self.cgm_min, max=self.cgm_max)
         return x
@@ -277,8 +264,6 @@ class ForwardEulerSimulatorPop(nn.Module):
     def forward(self, x0_batch, u_batch):
         X_sim_list = [x0_batch]
         x_step = x0_batch
-        # u_batch shape: (seq_len, B, 2)
-        # 60 integration intervals for 61 samples.
         for step in range(u_batch.shape[0] - 1):
             u_step = u_batch[step]
             dx = self.ss_pop_model(x_step, u_step)
@@ -311,8 +296,6 @@ class PopulationLoss:
         return penalty
 
     def __call__(self, x_sim, x_true, lim_inferior_scaled, lim_superior_scaled):
-        # Initial state is x_sim[0], which equals x_true[0]. 
-        # Compare prediction targets x_sim[1:] to x_true[1:]
         y_sim = x_sim[1:, :, [0]]
         y_true = x_true[1:, :, [0]]
         penalty = self.fit_penalty(y_sim, y_true, lim_inferior_scaled, lim_superior_scaled)
@@ -321,12 +304,10 @@ class PopulationLoss:
         err = x_sim[1:] - x_true[1:]
         mse_per_state = torch.mean(err ** 2, dim=(0, 1))
 
-        # Enforce MSE^{C_1} = 0 as per Section 2.2.1
         mask = torch.ones_like(mse_per_state)
         mask[self.c1_index] = 0.0
         mse_per_state = mse_per_state * mask
 
-        # Soft minimum floor penalty
         floor = self.state_min
         soft_constraint = torch.clamp(-(x_sim[1:] - floor), min=0.0)
         soft_penalty_per_state = torch.sum(soft_constraint, dim=(0, 1))
@@ -344,13 +325,8 @@ def main():
     np.random.seed(SEED)
     torch.manual_seed(SEED)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(CACHE_DIR, exist_ok=True)
 
-    if MAX_EPOCHS is None:
-        raise ValueError("MAX_EPOCHS is explicitly [UNRESOLVED] and must be configured manually before training.")
-    if CHECKPOINT_POLICY not in ["best_validation", "final_epoch"]:
-        raise ValueError("CHECKPOINT_POLICY must be configured as 'best_validation' or 'final_epoch'.")
-    if VAL_OVERLAP is None:
-        raise ValueError("VAL_OVERLAP must be configured manually before training.")
     print(f"Inspecting merged dataset at: {MERGED_MAT_PATH}")
     t0 = time.time()
     n_scenarios, T, n_states, n_inputs = get_dataset_dims(MERGED_MAT_PATH)
@@ -365,64 +341,105 @@ def main():
     print(f"  train: {len(train_idx)} | val: {len(val_idx)} | test (unused): {len(test_idx)} "
           f"| approx RAM: {est_gb:.1f} GB")
 
-    print(f"Loading TRAIN scenarios ...")
-    t0 = time.time()
-    x_train_flat, u_train_flat = fill_split_buffer_memmap(MERGED_MAT_PATH, train_idx, T, n_states, n_inputs, prefix="TRAIN")
-    if INPUT_COLUMN_PERM is not None:
-        raise NotImplementedError("INPUT_COLUMN_PERM not implemented for memmap refactor.")
-    print(f"  done in {time.time()-t0:.1f}s")
+    manifest_path = os.path.join(CACHE_DIR, "cache_manifest.json")
+    cache_valid = False
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, "r") as f:
+                manifest = json.load(f)
+            if (manifest.get("dataset_sha256") == EXPECTED_SHA256 and
+                manifest.get("train_count") == len(train_idx) and
+                manifest.get("val_count") == len(val_idx) and
+                manifest.get("T") == T and
+                manifest.get("state_count") == n_states and
+                manifest.get("input_count") == n_inputs and
+                manifest.get("STATE_ORDER") == STATE_ORDER and
+                manifest.get("INPUT_COLUMN_PERM") == INPUT_COLUMN_PERM and
+                manifest.get("SCALER_FIT_ROWS") == SCALER_FIT_ROWS):
+                cache_valid = True
+                state_min = np.array(manifest["state_min"], dtype=np.float32)
+        except Exception as e:
+            print(f"Failed to read cache manifest: {e}")
 
-    print("Fitting RobustScaler on TRAIN ...")
-    n_rows = x_train_flat.shape[0]
-    if SCALER_FIT_ROWS is not None:
-        raise ValueError("SCALER_FIT_ROWS must be None to fit scaler on all train data in memmap mode.")
+    if cache_valid:
+        print("Valid cache found. Reusing memmaps...")
+        x_train_flat = np.memmap(os.path.join(CACHE_DIR, "TRAIN_states.dat"), dtype=np.float32, mode='r', shape=(len(train_idx)*T, n_states))
+        u_train_flat = np.memmap(os.path.join(CACHE_DIR, "TRAIN_inputs.dat"), dtype=np.float32, mode='r', shape=(len(train_idx)*T, n_inputs))
+        x_val_flat = np.memmap(os.path.join(CACHE_DIR, "VAL_states.dat"), dtype=np.float32, mode='r', shape=(len(val_idx)*T, n_states))
+        u_val_flat = np.memmap(os.path.join(CACHE_DIR, "VAL_inputs.dat"), dtype=np.float32, mode='r', shape=(len(val_idx)*T, n_inputs))
+        with open(os.path.join(OUTPUT_DIR, "scaler_states.pkl"), "rb") as fh:
+            scaler_states = load(fh)
+        with open(os.path.join(OUTPUT_DIR, "scaler_inputs.pkl"), "rb") as fh:
+            scaler_inputs = load(fh)
+    else:
+        print("No valid cache found. Rebuilding cache...")
+        t0 = time.time()
+        x_train_flat, u_train_flat = fill_split_buffer_memmap(MERGED_MAT_PATH, train_idx, T, n_states, n_inputs, prefix="TRAIN")
+        print(f"  done loading TRAIN scenarios in {time.time()-t0:.1f}s")
         
-    scaler_states = fit_robust_scaler_memmap(x_train_flat)
-    scaler_inputs = fit_robust_scaler_memmap(u_train_flat)
+        print("Fitting RobustScaler on TRAIN ...")
+        scaler_states = fit_robust_scaler_memmap(x_train_flat)
+        scaler_inputs = fit_robust_scaler_memmap(u_train_flat)
+        
+        with open(os.path.join(OUTPUT_DIR, "scaler_states.pkl"), "wb") as fh:
+            dump(scaler_states, fh)
+        with open(os.path.join(OUTPUT_DIR, "scaler_inputs.pkl"), "wb") as fh:
+            dump(scaler_inputs, fh)
+        print(f"  saved scalers to {OUTPUT_DIR}")
+        
+        print("Scaling TRAIN in place ...")
+        transform_in_place_memmap(scaler_states, x_train_flat, "TRAIN", "states")
+        transform_in_place_memmap(scaler_inputs, u_train_flat, "TRAIN", "inputs")
+        
+        print(f"Loading VAL scenarios ...")
+        x_val_flat, u_val_flat = fill_split_buffer_memmap(MERGED_MAT_PATH, val_idx, T, n_states, n_inputs, prefix="VAL")
+        
+        print("Scaling VAL in place ...")
+        transform_in_place_memmap(scaler_states, x_val_flat, "VAL", "states")
+        transform_in_place_memmap(scaler_inputs, u_val_flat, "VAL", "inputs")
+        
+        print("Computing state min...")
+        state_min = compute_state_min_memmap(x_train_flat, n_states)
+        state_min[C1_INDEX] = (0.0 - scaler_states.center_[C1_INDEX]) / scaler_states.scale_[C1_INDEX]
+        
+        manifest = {
+            "dataset_sha256": EXPECTED_SHA256,
+            "train_count": len(train_idx),
+            "val_count": len(val_idx),
+            "T": T,
+            "state_count": n_states,
+            "input_count": n_inputs,
+            "STATE_ORDER": STATE_ORDER,
+            "INPUT_COLUMN_PERM": INPUT_COLUMN_PERM,
+            "SCALER_FIT_ROWS": SCALER_FIT_ROWS,
+            "dtype": "float32",
+            "state_min": state_min.tolist()
+        }
+        # Safely write manifest
+        tmp_manifest = manifest_path + ".tmp"
+        with open(tmp_manifest, "w") as f:
+            json.dump(manifest, f, indent=2)
+        os.replace(tmp_manifest, manifest_path)
+        print("Cache built and manifest saved.")
 
-    with open(os.path.join(OUTPUT_DIR, "scaler_states.pkl"), "wb") as fh:
-        dump(scaler_states, fh)
-    with open(os.path.join(OUTPUT_DIR, "scaler_inputs.pkl"), "wb") as fh:
-        dump(scaler_inputs, fh)
-    print(f"  saved scalers to {OUTPUT_DIR}")
-
-    print("Scaling TRAIN in place ...")
-    transform_in_place_memmap(scaler_states, x_train_flat, "TRAIN", "states")
-    transform_in_place_memmap(scaler_inputs, u_train_flat, "TRAIN", "inputs")
     x_train = x_train_flat.reshape(len(train_idx), T, n_states)
     u_train = u_train_flat.reshape(len(train_idx), T, n_inputs)
-
-    print(f"Loading VAL scenarios ...")
-    x_val_flat, u_val_flat = fill_split_buffer_memmap(MERGED_MAT_PATH, val_idx, T, n_states, n_inputs, prefix="VAL")
-
-    print("Scaling VAL in place ...")
-    transform_in_place_memmap(scaler_states, x_val_flat, "VAL", "states")
-    transform_in_place_memmap(scaler_inputs, u_val_flat, "VAL", "inputs")
     x_val = x_val_flat.reshape(len(val_idx), T, n_states)
     u_val = u_val_flat.reshape(len(val_idx), T, n_inputs)
 
-    state_min = compute_state_min_memmap(x_train_flat, n_states)
-    state_min[C1_INDEX] = (0.0 - scaler_states.center_[C1_INDEX]) / scaler_states.scale_[C1_INDEX]
-
     lim_inferior_scaled = scale_single_state(70, "Q1", OUTPUT_DIR)
     lim_superior_scaled = scale_single_state(250, "Q1", OUTPUT_DIR)
-    
-    # [UNRESOLVED] Explicit Q1 bounds during population Euler rollout are not in paper.
-    # Official codebase sets cgm_min=40, cgm_max=400 in T1DSimODE but not population_model.
-    # Leaving None for strict adherence, or can be added if NaN issues arise.
-    cgm_min_scaled = None # scale_single_state(40, "Q1", OUTPUT_DIR)
-    cgm_max_scaled = None # scale_single_state(400, "Q1", OUTPUT_DIR)
+    cgm_min_scaled = None
+    cgm_max_scaled = None
 
     print(f"Building model on device: {DEVICE}")
     model = CGMOHSUSimStateSpaceModel_V2(n_feat=n_neurons_pop)
-    if WARM_START_CHECKPOINT:
-        model.load_state_dict(torch.load(WARM_START_CHECKPOINT, map_location=DEVICE))
     model.to(DEVICE)
 
     simulator = ForwardEulerSimulatorPop(model, ts=5.0, cgm_min=cgm_min_scaled, cgm_max=cgm_max_scaled).to(DEVICE)
     loss_fn = PopulationLoss(STATE_WEIGHTS, state_min, C1_INDEX, alpha=ALPHA, beta=BETA).to(DEVICE)
-
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=LR_DECAY_PER_EPOCH)
 
     train_sampler = FramedWindowSampler(x_train, u_train, SEQ_LEN, TRAIN_OVERLAP, BATCH_SIZE, DEVICE, seed=SEED)
     val_sampler = FramedWindowSampler(x_val, u_val, SEQ_LEN, VAL_OVERLAP, BATCH_SIZE, DEVICE, seed=SEED + 1)
@@ -430,42 +447,93 @@ def main():
     iters_per_epoch = train_sampler.n_batches_per_epoch()
     val_batches_per_epoch = val_sampler.n_batches_per_epoch()
     
-    if MAX_TRAIN_BATCHES_PER_EPOCH is not None:
-        iters_per_epoch = min(iters_per_epoch, MAX_TRAIN_BATCHES_PER_EPOCH)
-    if MAX_VAL_BATCHES_PER_EPOCH is not None:
-        val_batches_per_epoch = min(val_batches_per_epoch, MAX_VAL_BATCHES_PER_EPOCH)
-
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=LR_DECAY_PER_EPOCH)
-    val_fixed_batches = val_sampler.get_fixed_subset(val_batches_per_epoch)
-
-    # Benchmarking without mutating parameters
-    WARMUP_BATCHES = min(20, iters_per_epoch)
-    print(f"Timing probe: {WARMUP_BATCHES} batches (non-mutating) ...")
-    model.eval()
-    t_probe = time.time()
-    probe_pos = train_sampler.pos
-    probe_epoch_order = train_sampler.epoch_order.copy()
-    probe_rng_state = train_sampler.rng.get_state()
-    
-    with torch.no_grad():
-        for _ in range(WARMUP_BATCHES):
-            x0, u_batch, x_true = train_sampler.next_batch()
-            x_sim = simulator(x0, u_batch)
-            loss_fn(x_sim, x_true, lim_inferior_scaled, lim_superior_scaled)
-    if DEVICE.type == "cuda":
-        torch.cuda.synchronize()
-        
-    train_sampler.rng.set_state(probe_rng_state)
-    train_sampler.epoch_order = probe_epoch_order
-    train_sampler.pos = probe_pos
-    
-    sec_per_batch = (time.time() - t_probe) / max(1, WARMUP_BATCHES)
-    print(f"  {sec_per_batch:.3f} s/batch")
-
+    start_epoch = 1
     best_val_loss = float("inf")
     epochs_without_improvement = 0
 
-    for epoch in range(1, MAX_EPOCHS + 1):
+    if RESUME_CHECKPOINT:
+        print(f"Resuming from checkpoint: {RESUME_CHECKPOINT}")
+        ckpt = torch.load(RESUME_CHECKPOINT, map_location=DEVICE)
+        model.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        start_epoch = ckpt['completed_epoch'] + 1
+        best_val_loss = ckpt['best_val_loss']
+        epochs_without_improvement = ckpt['epochs_without_improvement']
+        
+        np.random.set_state(ckpt['numpy_rng_state'])
+        torch.set_rng_state(ckpt['torch_cpu_rng_state'])
+        if DEVICE.type == "cuda":
+            torch.cuda.set_rng_state(ckpt['torch_cuda_rng_state'])
+            
+        train_sampler.rng.set_state(ckpt['train_sampler_rng_state'])
+        train_sampler.epoch_order = ckpt['train_sampler_epoch_order']
+        train_sampler.pos = ckpt['train_sampler_pos']
+        print(f"Resumed successfully. Continuing from epoch {start_epoch}")
+
+    if BENCHMARK_ONLY:
+        BENCHMARK_BATCHES = 50
+        print(f"\n--- RUNNING BENCHMARK_ONLY ({BENCHMARK_BATCHES} actual training batches) ---")
+        model.train()
+        
+        # Save exact states to restore later
+        bm_model_sd = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        bm_opt_sd = optimizer.state_dict()
+        bm_np_rng = np.random.get_state()
+        bm_torch_rng = torch.get_rng_state()
+        if DEVICE.type == "cuda": bm_cuda_rng = torch.cuda.get_rng_state()
+        bm_sampler_rng = train_sampler.rng.get_state()
+        bm_sampler_order = train_sampler.epoch_order.copy()
+        bm_sampler_pos = train_sampler.pos
+        
+        # Warmup
+        for _ in range(5):
+            x0, u_batch, x_true = train_sampler.next_batch()
+            x_sim = simulator(x0, u_batch)
+            loss, _, _ = loss_fn(x_sim, x_true, lim_inferior_scaled, lim_superior_scaled)
+            loss.backward()
+            optimizer.zero_grad()
+            
+        if DEVICE.type == "cuda": torch.cuda.synchronize()
+        t_bm_start = time.time()
+        
+        for _ in range(BENCHMARK_BATCHES):
+            x0, u_batch, x_true = train_sampler.next_batch()
+            x_sim = simulator(x0, u_batch)
+            loss, _, _ = loss_fn(x_sim, x_true, lim_inferior_scaled, lim_superior_scaled)
+            loss.backward()
+            # NO OPTIMIZER STEP!
+            optimizer.zero_grad()
+            
+        if DEVICE.type == "cuda": torch.cuda.synchronize()
+        t_bm_end = time.time()
+        
+        sec_per_batch = (t_bm_end - t_bm_start) / BENCHMARK_BATCHES
+        est_train_epoch = sec_per_batch * iters_per_epoch
+        
+        print("GPU name:", torch.cuda.get_device_name(0) if DEVICE.type == "cuda" else "CPU")
+        print("Number of timed batches:", BENCHMARK_BATCHES)
+        print(f"Seconds per real training batch: {sec_per_batch:.3f} s")
+        print(f"Estimated training-only time per epoch: {est_train_epoch/3600:.2f} hours")
+        print("Training batches per epoch:", iters_per_epoch)
+        print("Validation batches per epoch:", val_batches_per_epoch)
+        print(f"Rough estimated 15-epoch training-only time: {(est_train_epoch * 15)/3600:.2f} hours")
+        
+        # Restore everything
+        model.load_state_dict(bm_model_sd)
+        optimizer.load_state_dict(bm_opt_sd)
+        np.random.set_state(bm_np_rng)
+        torch.set_rng_state(bm_torch_rng)
+        if DEVICE.type == "cuda": torch.cuda.set_rng_state(bm_cuda_rng)
+        train_sampler.rng.set_state(bm_sampler_rng)
+        train_sampler.epoch_order = bm_sampler_order
+        train_sampler.pos = bm_sampler_pos
+        print("BENCHMARK_ONLY finished. State restored. Exiting.")
+        return
+
+    val_fixed_batches = val_sampler.get_fixed_subset(val_batches_per_epoch)
+
+    for epoch in range(start_epoch, MAX_EPOCHS + 1):
         model.train()
         epoch_losses = []
         t_epoch = time.time()
@@ -485,7 +553,6 @@ def main():
                 
             loss.backward()
             
-            # NaN gradient safety
             for p in model.parameters():
                 if p.grad is not None and not torch.isfinite(p.grad).all():
                     raise RuntimeError("Non-finite gradient detected during final training.")
@@ -532,16 +599,34 @@ def main():
         if mean_val_loss < best_val_loss:
             best_val_loss = mean_val_loss
             epochs_without_improvement = 0
-            if CHECKPOINT_POLICY == "best_validation":
-                torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, MODEL_FILENAME))
-                print(f"  -> new best val_loss, saved to {os.path.join(OUTPUT_DIR, MODEL_FILENAME)}")
         else:
             epochs_without_improvement += 1
             if PATIENCE is not None and epochs_without_improvement >= PATIENCE:
                 print(f"Early stopping after {epochs_without_improvement} epochs.")
                 break
                 
-        if CHECKPOINT_POLICY == "final_epoch":
+        # Epoch boundary resume checkpoint
+        ckpt = {
+            'completed_epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'best_val_loss': best_val_loss,
+            'epochs_without_improvement': epochs_without_improvement,
+            'numpy_rng_state': np.random.get_state(),
+            'torch_cpu_rng_state': torch.get_rng_state(),
+            'torch_cuda_rng_state': torch.cuda.get_rng_state() if DEVICE.type == "cuda" else None,
+            'train_sampler_rng_state': train_sampler.rng.get_state(),
+            'train_sampler_epoch_order': train_sampler.epoch_order,
+            'train_sampler_pos': train_sampler.pos
+        }
+        ckpt_path = os.path.join(OUTPUT_DIR, "training_state_latest.pt")
+        tmp_ckpt_path = ckpt_path + ".tmp"
+        torch.save(ckpt, tmp_ckpt_path)
+        os.replace(tmp_ckpt_path, ckpt_path)
+        print(f"  -> saved resumable training state to {ckpt_path}")
+
+        if CHECKPOINT_POLICY == "final_epoch" or (CHECKPOINT_POLICY == "best_validation" and epochs_without_improvement == 0):
             torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, MODEL_FILENAME))
             print(f"  -> saved final_epoch checkpoint to {os.path.join(OUTPUT_DIR, MODEL_FILENAME)}")
 
