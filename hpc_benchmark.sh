@@ -1,6 +1,4 @@
 #!/bin/bash
-set -euo pipefail
-
 #SBATCH --job-name=t1d_bench
 #SBATCH --partition=gpu5
 #SBATCH --gres=gpu:a100_1g.20gb:1
@@ -10,6 +8,8 @@ set -euo pipefail
 #SBATCH --output=bench_%j.out
 #SBATCH --error=bench_%j.err
 #SBATCH --chdir=/nfs/slurm/cugp012/training_population
+
+set -euo pipefail
 
 echo "Hostname: $(hostname)"
 echo "Date: $(date)"

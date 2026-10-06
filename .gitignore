@@ -8,6 +8,7 @@ env/
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
 
 # IDEs
 .vscode/
@@ -20,3 +21,5 @@ models/PopulationModel_v2/
 *.err
 *.log
 *.dat
+*.mat
+*.tmp

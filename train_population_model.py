@@ -372,10 +372,14 @@ def main():
             with open(manifest_path, "r") as f:
                 manifest = json.load(f)
                 
-            # 1. Dataset size must match
+            # 1. Dataset size and identity must match
             ds_size = os.path.getsize(MERGED_MAT_PATH)
             if ds_size != EXPECTED_DATASET_SIZE or manifest.get("dataset_size") != EXPECTED_DATASET_SIZE:
                 raise ValueError("Dataset size mismatch")
+            if manifest.get("dataset_sha256") != EXPECTED_SHA256:
+                raise ValueError("Dataset SHA256 mismatch")
+            if manifest.get("dtype") != "float32":
+                raise ValueError("Cache dtype mismatch")
                 
             # 2. Metadata checks
             if not (manifest.get("CACHE_SCHEMA_VERSION") == 1 and
@@ -430,6 +434,8 @@ def main():
                 
             cache_valid = True
             state_min = np.array(manifest["state_min"], dtype=np.float32)
+            if len(state_min) != n_states or not np.isfinite(state_min).all():
+                raise ValueError("state_min is invalid")
             scaler_states = test_ss
             scaler_inputs = test_si
             
@@ -744,8 +750,11 @@ def main():
         print(f"  -> saved resumable training state to {ckpt_path}")
 
         if CHECKPOINT_POLICY == "final_epoch" or (CHECKPOINT_POLICY == "best_validation" and epochs_without_improvement == 0):
-            torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, MODEL_FILENAME))
-            print(f"  -> saved final_epoch checkpoint to {os.path.join(OUTPUT_DIR, MODEL_FILENAME)}")
+            model_out_path = os.path.join(OUTPUT_DIR, MODEL_FILENAME)
+            tmp_model_path = model_out_path + ".tmp"
+            torch.save(model.state_dict(), tmp_model_path)
+            os.replace(tmp_model_path, model_out_path)
+            print(f"  -> saved final_epoch checkpoint to {model_out_path}")
 
     print(f"Training complete.")
 

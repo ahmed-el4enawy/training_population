@@ -15,52 +15,36 @@ This repository reproduces the population-level training pipeline from:
 ## Known Upstream Limitations
 - **Day-ID Leakage**: The fixed upstream generator assigned dataset splits by evaluating the identity of the entire sorted 7-day tuple, rather than individual daily scenarios. Consequently, individual meal `day_ids` may leak across the Train/Val/Test boundaries. The downstream training scripts inherit this physical artifact directly to maintain experimental integrity.
 
-## Unresolved Scientific Choices
-The paper omits certain explicit population-level constants. To enforce scientific rigor, you **must explicitly select** these values inside `train_population_model.py` and `evaluate_population_model.py` before running:
-1. `MAX_EPOCHS`: The population training epoch limit (the paper's `150` applies to individual-level models, and official code checkpoints suggest `15`).
-2. `PATIENCE`: Optional early stopping.
-3. `CHECKPOINT_POLICY`: Whether to use the `final_epoch` or `best_validation` weights.
-4. `VAL_OVERLAP`: Stride for validation sequences (BayesOpt states 0 overlap, final model is ambiguous).
-5. `TEST_OVERLAP`: Stride for the final test set evaluations.
+## Scientific Configuration
+The production configuration is strictly defined based on the paper or official artifacts:
+- **PAPER-EXPLICIT**: `SEQ_LEN = 61`, `TRAIN_OVERLAP = 0.75`, `BATCH_SIZE = 128`, `LR = 1e-3`, `ALPHA = 0.7`, `BETA = 0.08`, `LR_DECAY_PER_EPOCH = np.exp(-0.1)`
+- **RECONSTRUCTION / OFFICIAL ARTIFACTS**: 
+  - `MAX_EPOCHS = 15`
+  - `PATIENCE = None`
+  - `VAL_OVERLAP = 0.0`
+  - `TEST_OVERLAP = 0.0`
+  - `CHECKPOINT_POLICY = "final_epoch"`
 
-## Usage
-
-### 1. Clone and Initialize
-```bash
-git clone https://github.com/ahmed-el4enawy/training_population.git
-cd training_population
-git submodule update --init
-```
-
-### 2. Environment Setup
-```bash
-pip install -r requirements.txt
-# If T1DSim_AI is not in your python path, you can install it in editable mode:
-pip install -e ./T1DSim_AI
-```
-
-### 3. Pipeline
-1. **Merge Data**: (Produces `population_development_dataset_merged.mat` with explicit splits)
-   ```bash
-   python merge_parts.py
-   ```
-2. **Train Population Model**: 
-   ```bash
-   python train_population_model.py
-   ```
-3. **Evaluate**: 
-   ```bash
-   python evaluate_population_model.py
-   ```
+## Pre-Generated Datasets
+The population dataset is already generated, fixed, and must not be regenerated/resplit for this reproduction. `merge_parts.py` is included for provenance/reconstruction only.
 
 ## MOHESR HPC Usage
+The repository is configured for the MOHESR HPC gpu5 partition. The environment expects:
+- Python 3.11.16
+- PyTorch 1.13.0+cu117
+- CUDA runtime 11.7
+- h5py 3.16.0
+- numpy 1.23.5
+- scikit-learn 1.2.2
+- scipy 1.15.3
+- joblib 1.6.0
+- The `T1DSim_AI` package (pinned submodule, editable install)
 
-The repository is configured for the MOHESR HPC gpu5 partition.
-
-### Paths
+### Paths & Artifacts
 - **Dataset**: `/tmp/cugp012/population_development_dataset_merged.mat`
 - **Cache**: `/tmp/cugp012/cache`
-- **Outputs**: `/nfs/slurm/cugp012/training_population/models/PopulationModel_v2/`
+- **Reference Models**: `models/PopulationModel/` (Preserved legacy reference results)
+- **Production Outputs**: `models/PopulationModel_v2/` (Outputs of the new final HPC reproduction)
 
 ### 1. Prepare Cache
 To safely build the memmap cache, validate the dataset SHA-256, and dump a verified `cache_manifest.json` before training:
