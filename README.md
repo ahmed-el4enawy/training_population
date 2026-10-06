@@ -58,24 +58,33 @@ pip install -e ./T1DSim_AI
 The repository is configured for the MOHESR HPC gpu5 partition.
 
 ### Paths
-- **Dataset**: /tmp/cugp012/population_development_dataset_merged.mat
-- **Cache**: /tmp/cugp012/cache
-- **Outputs**: /nfs/slurm/cugp012/training_population/models/PopulationModel_v2/
+- **Dataset**: `/tmp/cugp012/population_development_dataset_merged.mat`
+- **Cache**: `/tmp/cugp012/cache`
+- **Outputs**: `/nfs/slurm/cugp012/training_population/models/PopulationModel_v2/`
 
-### Benchmark Run
+### 1. Prepare Cache
+To safely build the memmap cache, validate the dataset SHA-256, and dump a verified `cache_manifest.json` before training:
+```bash
+sbatch hpc_prepare_cache.sh
+```
+
+### 2. Benchmark Run
 To accurately measure the real forward/backward timing per batch without updating the optimizer:
-`ash
+```bash
 sbatch hpc_benchmark.sh
-``n
-### Fresh Production Run
+```
+
+### 3. Fresh Production Run
 To start the full 15-epoch population training from scratch:
-`ash
+```bash
 sbatch hpc_train.sh
-``n
-### Resumed Production Run
+```
+
+### 4. Resumed Production Run
 To safely resume training from the exact state saved at the last completed epoch boundary:
-`ash
+```bash
 sbatch --export=ALL,RESUME_CHECKPOINT=/nfs/slurm/cugp012/training_population/models/PopulationModel_v2/training_state_latest.pt hpc_train.sh
-``n
+```
+
 ### Slurm Logs
-Logs are saved as ench_%j.out, ench_%j.err, 	rain_%j.out, 	rain_%j.err in the repository root.
+Logs are saved as `cache_%j.out`, `cache_%j.err`, `bench_%j.out`, `bench_%j.err`, `train_%j.out`, `train_%j.err` in the repository root.

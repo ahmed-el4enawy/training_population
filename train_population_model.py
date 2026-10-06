@@ -10,6 +10,7 @@ Section 2.2.2 of Roquemen-Echeverri et al. (arXiv:2508.05705).
 import os
 import time
 import json
+import hashlib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -32,6 +33,7 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/nfs/slurm/cugp012/training_populatio
 MODEL_FILENAME = "population_model_trained.pt"
 RESUME_CHECKPOINT = os.environ.get("RESUME_CHECKPOINT", None)
 BENCHMARK_ONLY = os.environ.get("BENCHMARK_ONLY", "0") == "1"
+PREPARE_CACHE_ONLY = os.environ.get("PREPARE_CACHE_ONLY", "0") == "1"
 
 # [ENGINEERING / REPRODUCIBILITY]
 SEED = 0
@@ -44,16 +46,13 @@ LR = 1e-3
 WEIGHT_DECAY = 0.0 # [OFFICIAL-CODE-DERIVED]
 ALPHA = 0.7
 BETA = 0.08
-# Paper says e^-0.1 per epoch, which we apply after every FULL pass.
 LR_DECAY_PER_EPOCH = np.exp(-0.1)
 
-# [UNRESOLVED] -> Resolved for Final Run
 MAX_EPOCHS = 15
 PATIENCE = None
 VAL_OVERLAP = 0.0
 CHECKPOINT_POLICY = "final_epoch"
 
-# [ENGINEERING] (Memory management limits)
 MAX_TRAIN_SCENARIOS = None
 MAX_VAL_SCENARIOS = None
 MAX_TRAIN_BATCHES_PER_EPOCH = None
@@ -65,7 +64,6 @@ INPUT_COLUMN_PERM = None
 STATE_ORDER = ["Q1", "Q2", "S1", "S2", "I", "X1", "X2", "X3", "C2", "C1"]
 C1_INDEX = STATE_ORDER.index("C1")
 
-# [RECONSTRUCTION] Exact rational fractions recreating paper's rounded decimals
 STATE_WEIGHTS = np.array(
     [5/24, 1/6, 1/12, 1/12, 1/12, 1/12, 1/12, 1/12, 1/12, 1/24],
     dtype=np.float32,
@@ -74,15 +72,25 @@ STATE_WEIGHTS = np.array(
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 _VDG = 0.16
 _MGDL_PER_MMOL = 18.0
+
+# Dataset specific known values
 EXPECTED_SHA256 = "6FCE64E2D5C695EA61BE5C376C061A6B937D5728B94FE293803D9D83766DA91C"
+EXPECTED_DATASET_SIZE = 29312941019
+
+def hash_file_sha256(filepath):
+    h = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        while chunk := f.read(8192 * 1024):
+            h.update(chunk)
+    return h.hexdigest().upper()
 
 # ==============================================================================
 # Data loading
 # ==============================================================================
 def get_dataset_dims(path):
     with h5py.File(path, "r") as f:
-        n_states, T, n_scenarios = f["dataset_states"].shape   # on disk (10,T,N)
-        n_inputs = f["dataset_inputs"].shape[0]                # on disk (2,T,N)
+        n_states, T, n_scenarios = f["dataset_states"].shape
+        n_inputs = f["dataset_inputs"].shape[0]
     return n_scenarios, T, n_states, n_inputs
 
 def get_splits(path, max_train=None, max_val=None):
@@ -343,36 +351,95 @@ def main():
 
     manifest_path = os.path.join(CACHE_DIR, "cache_manifest.json")
     cache_valid = False
+    
+    # Precompute expected sizes
+    sz_train_st = len(train_idx) * T * n_states * 4
+    sz_train_in = len(train_idx) * T * n_inputs * 4
+    sz_val_st = len(val_idx) * T * n_states * 4
+    sz_val_in = len(val_idx) * T * n_inputs * 4
+    
     if os.path.exists(manifest_path):
         try:
             with open(manifest_path, "r") as f:
                 manifest = json.load(f)
-            if (manifest.get("dataset_sha256") == EXPECTED_SHA256 and
-                manifest.get("train_count") == len(train_idx) and
-                manifest.get("val_count") == len(val_idx) and
-                manifest.get("T") == T and
-                manifest.get("state_count") == n_states and
-                manifest.get("input_count") == n_inputs and
-                manifest.get("STATE_ORDER") == STATE_ORDER and
-                manifest.get("INPUT_COLUMN_PERM") == INPUT_COLUMN_PERM and
-                manifest.get("SCALER_FIT_ROWS") == SCALER_FIT_ROWS):
-                cache_valid = True
-                state_min = np.array(manifest["state_min"], dtype=np.float32)
+                
+            # 1. Dataset size must match
+            ds_size = os.path.getsize(MERGED_MAT_PATH)
+            if ds_size != EXPECTED_DATASET_SIZE or manifest.get("dataset_size") != EXPECTED_DATASET_SIZE:
+                raise ValueError("Dataset size mismatch")
+                
+            # 2. Metadata checks
+            if not (manifest.get("train_count") == len(train_idx) and
+                    manifest.get("val_count") == len(val_idx) and
+                    manifest.get("T") == T and
+                    manifest.get("state_count") == n_states and
+                    manifest.get("input_count") == n_inputs and
+                    manifest.get("STATE_ORDER") == STATE_ORDER and
+                    manifest.get("INPUT_COLUMN_PERM") == INPUT_COLUMN_PERM and
+                    manifest.get("SCALER_FIT_ROWS") == SCALER_FIT_ROWS):
+                raise ValueError("Metadata mismatch")
+                
+            # 3. File sizes strictly verified
+            cache_files = {
+                "TRAIN_states.dat": sz_train_st,
+                "TRAIN_inputs.dat": sz_train_in,
+                "VAL_states.dat": sz_val_st,
+                "VAL_inputs.dat": sz_val_in
+            }
+            for fname, exp_sz in cache_files.items():
+                fpath = os.path.join(CACHE_DIR, fname)
+                if not os.path.exists(fpath) or os.path.getsize(fpath) != exp_sz:
+                    raise ValueError(f"Cache file missing or size mismatch: {fname}")
+                    
+            scaler_states_path = os.path.join(OUTPUT_DIR, "scaler_states.pkl")
+            scaler_inputs_path = os.path.join(OUTPUT_DIR, "scaler_inputs.pkl")
+            if not os.path.exists(scaler_states_path) or not os.path.exists(scaler_inputs_path):
+                raise ValueError("Scaler files missing")
+                
+            # 4. Load scalers and strictly compare against manifest metadata
+            with open(scaler_states_path, "rb") as fh:
+                test_ss = load(fh)
+            with open(scaler_inputs_path, "rb") as fh:
+                test_si = load(fh)
+                
+            man_ss = manifest.get("scaler_states", {})
+            man_si = manifest.get("scaler_inputs", {})
+            
+            if not (test_ss.n_features_in_ == man_ss.get("n_features_in_") and
+                    np.allclose(test_ss.center_, man_ss.get("center_", [])) and
+                    np.allclose(test_ss.scale_, man_ss.get("scale_", [])) and
+                    test_si.n_features_in_ == man_si.get("n_features_in_") and
+                    np.allclose(test_si.center_, man_si.get("center_", [])) and
+                    np.allclose(test_si.scale_, man_si.get("scale_", []))):
+                raise ValueError("Scaler metadata mismatch")
+                
+            cache_valid = True
+            state_min = np.array(manifest["state_min"], dtype=np.float32)
+            scaler_states = test_ss
+            scaler_inputs = test_si
+            
         except Exception as e:
-            print(f"Failed to read cache manifest: {e}")
+            print(f"Cache validation failed: {e}. Rebuilding...")
+            cache_valid = False
 
-    if cache_valid:
-        print("Valid cache found. Reusing memmaps...")
-        x_train_flat = np.memmap(os.path.join(CACHE_DIR, "TRAIN_states.dat"), dtype=np.float32, mode='r', shape=(len(train_idx)*T, n_states))
-        u_train_flat = np.memmap(os.path.join(CACHE_DIR, "TRAIN_inputs.dat"), dtype=np.float32, mode='r', shape=(len(train_idx)*T, n_inputs))
-        x_val_flat = np.memmap(os.path.join(CACHE_DIR, "VAL_states.dat"), dtype=np.float32, mode='r', shape=(len(val_idx)*T, n_states))
-        u_val_flat = np.memmap(os.path.join(CACHE_DIR, "VAL_inputs.dat"), dtype=np.float32, mode='r', shape=(len(val_idx)*T, n_inputs))
-        with open(os.path.join(OUTPUT_DIR, "scaler_states.pkl"), "rb") as fh:
-            scaler_states = load(fh)
-        with open(os.path.join(OUTPUT_DIR, "scaler_inputs.pkl"), "rb") as fh:
-            scaler_inputs = load(fh)
-    else:
+    if not cache_valid:
+        if BENCHMARK_ONLY:
+            raise RuntimeError("Benchmark mode requires a valid completed cache. Run PREPARE_CACHE_ONLY=1 first.")
+
         print("No valid cache found. Rebuilding cache...")
+        
+        # Verify dataset size and SHA-256 before building
+        actual_size = os.path.getsize(MERGED_MAT_PATH)
+        if actual_size != EXPECTED_DATASET_SIZE:
+            raise RuntimeError(f"Dataset size mismatch! Expected {EXPECTED_DATASET_SIZE}, got {actual_size}")
+            
+        print("Verifying dataset SHA-256 (this may take a minute)...")
+        t_hash = time.time()
+        actual_sha256 = hash_file_sha256(MERGED_MAT_PATH)
+        if actual_sha256 != EXPECTED_SHA256:
+            raise RuntimeError(f"Dataset SHA-256 mismatch! Expected {EXPECTED_SHA256}, got {actual_sha256}")
+        print(f"Dataset verified successfully [{time.time() - t_hash:.1f}s].")
+
         t0 = time.time()
         x_train_flat, u_train_flat = fill_split_buffer_memmap(MERGED_MAT_PATH, train_idx, T, n_states, n_inputs, prefix="TRAIN")
         print(f"  done loading TRAIN scenarios in {time.time()-t0:.1f}s")
@@ -403,7 +470,8 @@ def main():
         state_min[C1_INDEX] = (0.0 - scaler_states.center_[C1_INDEX]) / scaler_states.scale_[C1_INDEX]
         
         manifest = {
-            "dataset_sha256": EXPECTED_SHA256,
+            "dataset_sha256": actual_sha256,
+            "dataset_size": actual_size,
             "train_count": len(train_idx),
             "val_count": len(val_idx),
             "T": T,
@@ -413,14 +481,33 @@ def main():
             "INPUT_COLUMN_PERM": INPUT_COLUMN_PERM,
             "SCALER_FIT_ROWS": SCALER_FIT_ROWS,
             "dtype": "float32",
-            "state_min": state_min.tolist()
+            "state_min": state_min.tolist(),
+            "scaler_states": {
+                "n_features_in_": scaler_states.n_features_in_,
+                "center_": scaler_states.center_.tolist(),
+                "scale_": scaler_states.scale_.tolist()
+            },
+            "scaler_inputs": {
+                "n_features_in_": scaler_inputs.n_features_in_,
+                "center_": scaler_inputs.center_.tolist(),
+                "scale_": scaler_inputs.scale_.tolist()
+            }
         }
-        # Safely write manifest
         tmp_manifest = manifest_path + ".tmp"
         with open(tmp_manifest, "w") as f:
             json.dump(manifest, f, indent=2)
         os.replace(tmp_manifest, manifest_path)
         print("Cache built and manifest saved.")
+    else:
+        print("Valid cache found. Reusing memmaps...")
+        x_train_flat = np.memmap(os.path.join(CACHE_DIR, "TRAIN_states.dat"), dtype=np.float32, mode='r', shape=(len(train_idx)*T, n_states))
+        u_train_flat = np.memmap(os.path.join(CACHE_DIR, "TRAIN_inputs.dat"), dtype=np.float32, mode='r', shape=(len(train_idx)*T, n_inputs))
+        x_val_flat = np.memmap(os.path.join(CACHE_DIR, "VAL_states.dat"), dtype=np.float32, mode='r', shape=(len(val_idx)*T, n_states))
+        u_val_flat = np.memmap(os.path.join(CACHE_DIR, "VAL_inputs.dat"), dtype=np.float32, mode='r', shape=(len(val_idx)*T, n_inputs))
+
+    if PREPARE_CACHE_ONLY:
+        print("PREPARE_CACHE_ONLY finished. Cache is valid and ready. Exiting.")
+        return
 
     x_train = x_train_flat.reshape(len(train_idx), T, n_states)
     u_train = u_train_flat.reshape(len(train_idx), T, n_inputs)
@@ -476,7 +563,6 @@ def main():
         print(f"\n--- RUNNING BENCHMARK_ONLY ({BENCHMARK_BATCHES} actual training batches) ---")
         model.train()
         
-        # Save exact states to restore later
         bm_model_sd = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         bm_opt_sd = optimizer.state_dict()
         bm_np_rng = np.random.get_state()
@@ -486,7 +572,6 @@ def main():
         bm_sampler_order = train_sampler.epoch_order.copy()
         bm_sampler_pos = train_sampler.pos
         
-        # Warmup
         for _ in range(5):
             x0, u_batch, x_true = train_sampler.next_batch()
             x_sim = simulator(x0, u_batch)
@@ -519,7 +604,6 @@ def main():
         print("Validation batches per epoch:", val_batches_per_epoch)
         print(f"Rough estimated 15-epoch training-only time: {(est_train_epoch * 15)/3600:.2f} hours")
         
-        # Restore everything
         model.load_state_dict(bm_model_sd)
         optimizer.load_state_dict(bm_opt_sd)
         np.random.set_state(bm_np_rng)
@@ -605,7 +689,6 @@ def main():
                 print(f"Early stopping after {epochs_without_improvement} epochs.")
                 break
                 
-        # Epoch boundary resume checkpoint
         ckpt = {
             'completed_epoch': epoch,
             'model_state_dict': model.state_dict(),

@@ -13,12 +13,9 @@ __pycache__/
 .vscode/
 .idea/
 
-# Output directories
-models/PopulationModel_v2/
-
 # HPC Training outputs
-models/
 cache/
+models/PopulationModel_v2/
 *.out
 *.err
 *.log
