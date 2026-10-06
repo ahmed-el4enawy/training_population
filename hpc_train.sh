@@ -13,7 +13,6 @@ set -euo pipefail
 
 echo "Hostname: $(hostname)"
 echo "Date: $(date)"
-nvidia-smi
 
 /nfs/slurm/cugp012/envs/t1d/bin/python -c "import sys; print('Python version:', sys.version)"
 /nfs/slurm/cugp012/envs/t1d/bin/python -c "import torch; print('PyTorch version:', torch.__version__); print('CUDA runtime:', torch.version.cuda); print('CUDA availability:', torch.cuda.is_available()); print('GPU name:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None')"
