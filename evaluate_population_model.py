@@ -1,5 +1,5 @@
 """
-eval_population_model.py  (fixed version)
+evaluate_population_model.py  (fixed version)
 
 Evaluates the trained population NN model on the held-out simulated DP_test split
 using the paper's 5-hour glucose outcome metrics and TOST methodology.
@@ -20,8 +20,8 @@ from t1dsim_ai.utils.preprocess import scale_inverse_Q1
 from train_population_model import (
     get_dataset_dims,
     get_splits,
-    fill_split_buffer,
-    transform_in_place,
+    fill_split_buffer_memmap,
+    transform_in_place_memmap,
     FramedWindowSampler,
     ForwardEulerSimulatorPop,
     MERGED_MAT_PATH,
@@ -103,9 +103,9 @@ def main():
     print(f"  test scenarios to evaluate: {len(test_idx)}")
 
     print("Loading TEST scenarios from disk ...")
-    x_test_flat, u_test_flat = fill_split_buffer(MERGED_MAT_PATH, test_idx, T, n_states, n_inputs)
+    x_test_flat, u_test_flat = fill_split_buffer_memmap(MERGED_MAT_PATH, test_idx, T, n_states, n_inputs, prefix="EVAL_TEST")
     if INPUT_COLUMN_PERM is not None:
-        u_test_flat = np.ascontiguousarray(u_test_flat[:, INPUT_COLUMN_PERM])
+        raise NotImplementedError("INPUT_COLUMN_PERM not implemented for memmap refactor.")
 
     print("Loading saved scalers and scaling TEST data ...")
     with open(os.path.join(OUTPUT_DIR, "scaler_states.pkl"), "rb") as fh:
@@ -113,8 +113,8 @@ def main():
     with open(os.path.join(OUTPUT_DIR, "scaler_inputs.pkl"), "rb") as fh:
         scaler_inputs = load(fh)
     
-    transform_in_place(scaler_states, x_test_flat)
-    transform_in_place(scaler_inputs, u_test_flat)
+    transform_in_place_memmap(scaler_states, x_test_flat, "EVAL_TEST", "states")
+    transform_in_place_memmap(scaler_inputs, u_test_flat, "EVAL_TEST", "inputs")
     
     x_test = x_test_flat.reshape(len(test_idx), T, n_states)
     u_test = u_test_flat.reshape(len(test_idx), T, n_inputs)

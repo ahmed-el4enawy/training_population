@@ -330,6 +330,15 @@ class PopulationLoss:
 # Main
 # ==============================================================================
 def main():
+    if MAX_EPOCHS is None:
+        raise ValueError("MAX_EPOCHS must not be None.")
+    if CHECKPOINT_POLICY not in ["best_validation", "final_epoch"]:
+        raise ValueError("CHECKPOINT_POLICY must be 'best_validation' or 'final_epoch'.")
+    if VAL_OVERLAP is None:
+        raise ValueError("VAL_OVERLAP must not be None.")
+    if INPUT_COLUMN_PERM is not None:
+        raise NotImplementedError("INPUT_COLUMN_PERM not implemented for memmap refactor.")
+
     np.random.seed(SEED)
     torch.manual_seed(SEED)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -369,7 +378,8 @@ def main():
                 raise ValueError("Dataset size mismatch")
                 
             # 2. Metadata checks
-            if not (manifest.get("train_count") == len(train_idx) and
+            if not (manifest.get("CACHE_SCHEMA_VERSION") == 1 and
+                    manifest.get("train_count") == len(train_idx) and
                     manifest.get("val_count") == len(val_idx) and
                     manifest.get("T") == T and
                     manifest.get("state_count") == n_states and
@@ -396,14 +406,19 @@ def main():
             if not os.path.exists(scaler_states_path) or not os.path.exists(scaler_inputs_path):
                 raise ValueError("Scaler files missing")
                 
+            man_ss = manifest.get("scaler_states", {})
+            man_si = manifest.get("scaler_inputs", {})
+            
+            if hash_file_sha256(scaler_states_path) != man_ss.get("hash"):
+                raise ValueError("Scaler states hash mismatch")
+            if hash_file_sha256(scaler_inputs_path) != man_si.get("hash"):
+                raise ValueError("Scaler inputs hash mismatch")
+                
             # 4. Load scalers and strictly compare against manifest metadata
             with open(scaler_states_path, "rb") as fh:
                 test_ss = load(fh)
             with open(scaler_inputs_path, "rb") as fh:
                 test_si = load(fh)
-                
-            man_ss = manifest.get("scaler_states", {})
-            man_si = manifest.get("scaler_inputs", {})
             
             if not (test_ss.n_features_in_ == man_ss.get("n_features_in_") and
                     np.allclose(test_ss.center_, man_ss.get("center_", [])) and
@@ -441,25 +456,36 @@ def main():
         print(f"Dataset verified successfully [{time.time() - t_hash:.1f}s].")
 
         t0 = time.time()
-        x_train_flat, u_train_flat = fill_split_buffer_memmap(MERGED_MAT_PATH, train_idx, T, n_states, n_inputs, prefix="TRAIN")
+        x_train_flat, u_train_flat = fill_split_buffer_memmap(MERGED_MAT_PATH, train_idx, T, n_states, n_inputs, prefix="TRAIN", chunk_size=CHUNK_SCENARIOS)
         print(f"  done loading TRAIN scenarios in {time.time()-t0:.1f}s")
         
         print("Fitting RobustScaler on TRAIN ...")
         scaler_states = fit_robust_scaler_memmap(x_train_flat)
         scaler_inputs = fit_robust_scaler_memmap(u_train_flat)
         
-        with open(os.path.join(OUTPUT_DIR, "scaler_states.pkl"), "wb") as fh:
+        scaler_states_path = os.path.join(OUTPUT_DIR, "scaler_states.pkl")
+        scaler_inputs_path = os.path.join(OUTPUT_DIR, "scaler_inputs.pkl")
+        
+        tmp_ss = scaler_states_path + ".tmp"
+        with open(tmp_ss, "wb") as fh:
             dump(scaler_states, fh)
-        with open(os.path.join(OUTPUT_DIR, "scaler_inputs.pkl"), "wb") as fh:
+        os.replace(tmp_ss, scaler_states_path)
+        
+        tmp_si = scaler_inputs_path + ".tmp"
+        with open(tmp_si, "wb") as fh:
             dump(scaler_inputs, fh)
-        print(f"  saved scalers to {OUTPUT_DIR}")
+        os.replace(tmp_si, scaler_inputs_path)
+        
+        ss_sha256 = hash_file_sha256(scaler_states_path)
+        si_sha256 = hash_file_sha256(scaler_inputs_path)
+        print(f"  saved scalers atomically to {OUTPUT_DIR}")
         
         print("Scaling TRAIN in place ...")
         transform_in_place_memmap(scaler_states, x_train_flat, "TRAIN", "states")
         transform_in_place_memmap(scaler_inputs, u_train_flat, "TRAIN", "inputs")
         
         print(f"Loading VAL scenarios ...")
-        x_val_flat, u_val_flat = fill_split_buffer_memmap(MERGED_MAT_PATH, val_idx, T, n_states, n_inputs, prefix="VAL")
+        x_val_flat, u_val_flat = fill_split_buffer_memmap(MERGED_MAT_PATH, val_idx, T, n_states, n_inputs, prefix="VAL", chunk_size=CHUNK_SCENARIOS)
         
         print("Scaling VAL in place ...")
         transform_in_place_memmap(scaler_states, x_val_flat, "VAL", "states")
@@ -470,6 +496,7 @@ def main():
         state_min[C1_INDEX] = (0.0 - scaler_states.center_[C1_INDEX]) / scaler_states.scale_[C1_INDEX]
         
         manifest = {
+            "CACHE_SCHEMA_VERSION": 1,
             "dataset_sha256": actual_sha256,
             "dataset_size": actual_size,
             "train_count": len(train_idx),
@@ -483,11 +510,13 @@ def main():
             "dtype": "float32",
             "state_min": state_min.tolist(),
             "scaler_states": {
+                "hash": ss_sha256,
                 "n_features_in_": scaler_states.n_features_in_,
                 "center_": scaler_states.center_.tolist(),
                 "scale_": scaler_states.scale_.tolist()
             },
             "scaler_inputs": {
+                "hash": si_sha256,
                 "n_features_in_": scaler_inputs.n_features_in_,
                 "center_": scaler_inputs.center_.tolist(),
                 "scale_": scaler_inputs.scale_.tolist()
@@ -532,7 +561,12 @@ def main():
     val_sampler = FramedWindowSampler(x_val, u_val, SEQ_LEN, VAL_OVERLAP, BATCH_SIZE, DEVICE, seed=SEED + 1)
     
     iters_per_epoch = train_sampler.n_batches_per_epoch()
+    if MAX_TRAIN_BATCHES_PER_EPOCH is not None:
+        iters_per_epoch = min(iters_per_epoch, MAX_TRAIN_BATCHES_PER_EPOCH)
+        
     val_batches_per_epoch = val_sampler.n_batches_per_epoch()
+    if MAX_VAL_BATCHES_PER_EPOCH is not None:
+        val_batches_per_epoch = min(val_batches_per_epoch, MAX_VAL_BATCHES_PER_EPOCH)
     
     start_epoch = 1
     best_val_loss = float("inf")

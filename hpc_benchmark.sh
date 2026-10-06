@@ -1,4 +1,6 @@
 #!/bin/bash
+set -euo pipefail
+
 #SBATCH --job-name=t1d_bench
 #SBATCH --partition=gpu5
 #SBATCH --gres=gpu:a100_1g.20gb:1
