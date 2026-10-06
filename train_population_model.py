@@ -468,7 +468,10 @@ def main():
                 raise ValueError("Cache dtype mismatch")
                 
             # 2. Metadata checks
-            if not (manifest.get("CACHE_SCHEMA_VERSION") == 1 and
+            if not (manifest.get("CACHE_SCHEMA_VERSION") == 2 and
+                    manifest.get("paper_subset_version") == PAPER_SUBSET_VERSION and
+                    manifest.get("train_indices_sha256") == _indices_sha256(train_idx) and
+                    manifest.get("val_indices_sha256") == _indices_sha256(val_idx) and
                     manifest.get("train_count") == len(train_idx) and
                     manifest.get("val_count") == len(val_idx) and
                     manifest.get("T") == T and
@@ -588,9 +591,12 @@ def main():
         state_min[C1_INDEX] = (0.0 - scaler_states.center_[C1_INDEX]) / scaler_states.scale_[C1_INDEX]
         
         manifest = {
-            "CACHE_SCHEMA_VERSION": 1,
+            "CACHE_SCHEMA_VERSION": 2,
+            "paper_subset_version": PAPER_SUBSET_VERSION,
             "dataset_sha256": actual_sha256,
             "dataset_size": actual_size,
+            "train_indices_sha256": _indices_sha256(train_idx),
+            "val_indices_sha256": _indices_sha256(val_idx),
             "train_count": len(train_idx),
             "val_count": len(val_idx),
             "T": T,
@@ -641,7 +647,15 @@ def main():
     cgm_max_scaled = None
 
     print(f"Building model on device: {DEVICE}")
-    model = CGMOHSUSimStateSpaceModel_V2(n_feat=n_neurons_pop)
+    official_init_model = CGMOHSUSimStateSpaceModel_V2(n_feat=n_neurons_pop)
+    if USE_PACKED_MODEL:
+        model = PackedPopulationModel(official_init_model, n_neurons_pop)
+        print(
+            f"  packed equivalent model: {model.active_parameter_count()} active parameters "
+            f"(official architecture export enabled)"
+        )
+    else:
+        model = official_init_model
     model.to(DEVICE)
 
     simulator = ForwardEulerSimulatorPop(model, ts=5.0, cgm_min=cgm_min_scaled, cgm_max=cgm_max_scaled).to(DEVICE)
@@ -649,8 +663,17 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=LR_DECAY_PER_EPOCH)
 
-    train_sampler = FramedWindowSampler(x_train, u_train, SEQ_LEN, TRAIN_OVERLAP, BATCH_SIZE, DEVICE, seed=SEED)
-    val_sampler = FramedWindowSampler(x_val, u_val, SEQ_LEN, VAL_OVERLAP, BATCH_SIZE, DEVICE, seed=SEED + 1)
+    train_sampler = FramedWindowSampler(
+        x_train, u_train, SEQ_LEN, TRAIN_OVERLAP, BATCH_SIZE, DEVICE,
+        seed=SEED, max_sequences=TRAIN_SEQUENCE_LIMIT
+    )
+    val_sampler = FramedWindowSampler(
+        x_val, u_val, SEQ_LEN, VAL_OVERLAP, BATCH_SIZE, DEVICE, seed=SEED + 1
+    )
+    print(
+        f"Training sequence pool: {len(train_sampler.pairs):,} "
+        f"(paper reports approximately 1 million 5-hour sequences)"
+    )
     
     iters_per_epoch = train_sampler.n_batches_per_epoch()
     if MAX_TRAIN_BATCHES_PER_EPOCH is not None:
@@ -690,7 +713,7 @@ def main():
         model.train()
         
         bm_model_sd = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        bm_opt_sd = optimizer.state_dict()
+        bm_opt_sd = copy.deepcopy(optimizer.state_dict())
         bm_np_rng = np.random.get_state()
         bm_torch_rng = torch.get_rng_state()
         if DEVICE.type == "cuda": bm_cuda_rng = torch.cuda.get_rng_state()
@@ -699,22 +722,23 @@ def main():
         bm_sampler_pos = train_sampler.pos
         
         for _ in range(5):
+            optimizer.zero_grad(set_to_none=True)
             x0, u_batch, x_true = train_sampler.next_batch()
             x_sim = simulator(x0, u_batch)
             loss, _, _ = loss_fn(x_sim, x_true, lim_inferior_scaled, lim_superior_scaled)
             loss.backward()
-            optimizer.zero_grad()
-            
+            optimizer.step()
+
         if DEVICE.type == "cuda": torch.cuda.synchronize()
         t_bm_start = time.time()
-        
+
         for _ in range(BENCHMARK_BATCHES):
+            optimizer.zero_grad(set_to_none=True)
             x0, u_batch, x_true = train_sampler.next_batch()
             x_sim = simulator(x0, u_batch)
             loss, _, _ = loss_fn(x_sim, x_true, lim_inferior_scaled, lim_superior_scaled)
             loss.backward()
-            # NO OPTIMIZER STEP!
-            optimizer.zero_grad()
+            optimizer.step()
             
         if DEVICE.type == "cuda": torch.cuda.synchronize()
         t_bm_end = time.time()
@@ -724,11 +748,13 @@ def main():
         
         print("GPU name:", torch.cuda.get_device_name(0) if DEVICE.type == "cuda" else "CPU")
         print("Number of timed batches:", BENCHMARK_BATCHES)
-        print(f"Seconds per real training batch: {sec_per_batch:.3f} s")
+        print(f"Seconds per production-like training batch: {sec_per_batch:.3f} s")
         print(f"Estimated training-only time per epoch: {est_train_epoch/3600:.2f} hours")
         print("Training batches per epoch:", iters_per_epoch)
         print("Validation batches per epoch:", val_batches_per_epoch)
-        print(f"Rough estimated 15-epoch training-only time: {(est_train_epoch * 15)/3600:.2f} hours")
+        projected_hours = (est_train_epoch * MAX_EPOCHS) / 3600
+        print(f"Projected {MAX_EPOCHS}-epoch training-only time: {projected_hours:.2f} hours")
+        print(f"72-hour target margin: {72.0 - projected_hours:.2f} hours")
         
         model.load_state_dict(bm_model_sd)
         optimizer.load_state_dict(bm_opt_sd)
@@ -741,79 +767,89 @@ def main():
         print("BENCHMARK_ONLY finished. State restored. Exiting.")
         return
 
-    val_fixed_batches = val_sampler.get_fixed_subset(val_batches_per_epoch)
+    val_fixed_batches = (
+        val_sampler.get_fixed_subset(val_batches_per_epoch)
+        if RUN_VALIDATION_DURING_FINAL_TRAINING else []
+    )
 
     for epoch in range(start_epoch, MAX_EPOCHS + 1):
         model.train()
-        epoch_losses = []
+        epoch_loss_sum = torch.zeros((), dtype=torch.float32, device=DEVICE)
         t_epoch = time.time()
         print_every = max(1, min(50, iters_per_epoch // 10))
 
         for it in range(iters_per_epoch):
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             x0, u_batch, x_true = train_sampler.next_batch()
             x_sim = simulator(x0, u_batch)
-
-            if not torch.isfinite(x_sim).all():
-                raise RuntimeError("Non-finite simulation detected during final training.")
-
             loss, _, _ = loss_fn(x_sim, x_true, lim_inferior_scaled, lim_superior_scaled)
-            if not torch.isfinite(loss):
-                raise RuntimeError("Non-finite loss detected during final training.")
-                
             loss.backward()
-            
-            for p in model.parameters():
-                if p.grad is not None and not torch.isfinite(p.grad).all():
-                    raise RuntimeError("Non-finite gradient detected during final training.")
-                
+
+            # One synchronized finite check every 100 steps avoids dozens of
+            # per-parameter GPU synchronizations while still failing early.
+            if it % 100 == 0:
+                grad_tensors = [p.grad.reshape(-1) for p in model.parameters() if p.grad is not None]
+                finite = torch.isfinite(x_sim).all() & torch.isfinite(loss)
+                if grad_tensors:
+                    finite = finite & torch.isfinite(torch.cat(grad_tensors)).all()
+                if not bool(finite.item()):
+                    raise RuntimeError("Non-finite simulation/loss/gradient detected during final training.")
+
             optimizer.step()
-            epoch_losses.append(loss.item())
+            epoch_loss_sum.add_(loss.detach())
 
             if (it + 1) % print_every == 0 or (it + 1) == iters_per_epoch:
-                running_mean = np.mean(epoch_losses) if epoch_losses else float("nan")
+                running_mean = float((epoch_loss_sum / (it + 1)).item())
                 elapsed = time.time() - t_epoch
                 eta = elapsed / (it + 1) * iters_per_epoch
                 print(f"  epoch {epoch} [train {it+1}/{iters_per_epoch}] "
                       f"loss {running_mean:.6f} | elapsed {elapsed:.1f}s | estimated epoch training time {eta:.1f}s")
 
         scheduler.step()
-        model.eval()
-        with torch.no_grad():
-            val_losses = []
-            sq_err_sum = 0.0
-            n_err_vals = 0
-            for v_it, pair_batch in enumerate(val_fixed_batches):
-                x0, u_batch, x_true = val_sampler.batch_from_pairs(pair_batch)
-                x_sim = simulator(x0, u_batch)
-                if torch.isnan(x_sim).any() or torch.isinf(x_sim).any():
-                    continue
-                    
-                loss, _, _ = loss_fn(x_sim, x_true, lim_inferior_scaled, lim_superior_scaled)
-                val_losses.append(loss.item())
+        mean_train_loss = float(epoch_loss_sum.item() / max(1, iters_per_epoch))
 
-                y_sim_mgdl = scale_inverse_Q1(x_sim[1:, :, [0]].cpu().numpy(), OUTPUT_DIR)
-                y_true_mgdl = scale_inverse_Q1(x_true[1:, :, [0]].cpu().numpy(), OUTPUT_DIR)
-                batch_sq_err = (y_sim_mgdl - y_true_mgdl) ** 2
-                sq_err_sum += batch_sq_err.sum()
-                n_err_vals += batch_sq_err.size
+        if RUN_VALIDATION_DURING_FINAL_TRAINING:
+            model.eval()
+            with torch.no_grad():
+                val_losses = []
+                sq_err_sum = 0.0
+                n_err_vals = 0
+                for v_it, pair_batch in enumerate(val_fixed_batches):
+                    x0, u_batch, x_true = val_sampler.batch_from_pairs(pair_batch)
+                    x_sim = simulator(x0, u_batch)
+                    if not torch.isfinite(x_sim).all():
+                        continue
 
-        mean_train_loss = np.mean(epoch_losses) if epoch_losses else float("nan")
-        mean_val_loss = np.mean(val_losses) if val_losses else float("nan")
-        rmse_mgdl = np.sqrt(sq_err_sum / n_err_vals) if n_err_vals > 0 else float("nan")
+                    loss, _, _ = loss_fn(x_sim, x_true, lim_inferior_scaled, lim_superior_scaled)
+                    val_losses.append(loss.item())
 
-        print(f"Epoch {epoch:4d} | train_loss {mean_train_loss:.6f} | val_loss {mean_val_loss:.6f} | "
-              f"val_RMSE {rmse_mgdl:.2f} mg/dL | lr {optimizer.param_groups[0]['lr']:.2e} | "
-              f"time {time.time()-t_epoch:.1f}s")
+                    y_sim_mgdl = scale_inverse_Q1(x_sim[1:, :, [0]].cpu().numpy(), OUTPUT_DIR)
+                    y_true_mgdl = scale_inverse_Q1(x_true[1:, :, [0]].cpu().numpy(), OUTPUT_DIR)
+                    batch_sq_err = (y_sim_mgdl - y_true_mgdl) ** 2
+                    sq_err_sum += batch_sq_err.sum()
+                    n_err_vals += batch_sq_err.size
 
-        if mean_val_loss < best_val_loss:
-            best_val_loss = mean_val_loss
-            epochs_without_improvement = 0
+            mean_val_loss = np.mean(val_losses) if val_losses else float("nan")
+            rmse_mgdl = np.sqrt(sq_err_sum / n_err_vals) if n_err_vals > 0 else float("nan")
+            print(
+                f"Epoch {epoch:4d} | train_loss {mean_train_loss:.6f} | "
+                f"val_loss {mean_val_loss:.6f} | val_RMSE {rmse_mgdl:.2f} mg/dL | "
+                f"lr {optimizer.param_groups[0]['lr']:.2e} | time {time.time()-t_epoch:.1f}s"
+            )
+
+            if mean_val_loss < best_val_loss:
+                best_val_loss = mean_val_loss
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if PATIENCE is not None and epochs_without_improvement >= PATIENCE:
+                    print(f"Early stopping after {epochs_without_improvement} epochs.")
+                    break
         else:
-            epochs_without_improvement += 1
-            if PATIENCE is not None and epochs_without_improvement >= PATIENCE:
-                print(f"Early stopping after {epochs_without_improvement} epochs.")
-                break
+            print(
+                f"Epoch {epoch:4d} | train_loss {mean_train_loss:.6f} | "
+                f"lr {optimizer.param_groups[0]['lr']:.2e} | time {time.time()-t_epoch:.1f}s"
+            )
                 
         ckpt = {
             'completed_epoch': epoch,
@@ -835,12 +871,19 @@ def main():
         os.replace(tmp_ckpt_path, ckpt_path)
         print(f"  -> saved resumable training state to {ckpt_path}")
 
-        if CHECKPOINT_POLICY == "final_epoch" or (CHECKPOINT_POLICY == "best_validation" and epochs_without_improvement == 0):
+        if CHECKPOINT_POLICY == "final_epoch" or (
+            CHECKPOINT_POLICY == "best_validation" and epochs_without_improvement == 0
+        ):
             model_out_path = os.path.join(OUTPUT_DIR, MODEL_FILENAME)
             tmp_model_path = model_out_path + ".tmp"
-            torch.save(model.state_dict(), tmp_model_path)
+            export_sd = (
+                model.export_official_state_dict()
+                if isinstance(model, PackedPopulationModel)
+                else {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            )
+            torch.save(export_sd, tmp_model_path)
             os.replace(tmp_model_path, model_out_path)
-            print(f"  -> saved final_epoch checkpoint to {model_out_path}")
+            print(f"  -> saved official-layout checkpoint to {model_out_path}")
 
     print(f"Training complete.")
 
