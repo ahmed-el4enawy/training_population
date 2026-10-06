@@ -69,7 +69,7 @@ class PackedPopulationModel(nn.Module):
 
                 self.bias1[h0:h1].copy_(b0)
                 self.weight2[out_i, h0:h1].copy_(w1[0])
-                self.bias2[out_i].copy_(b1)
+                self.bias2[out_i].copy_(b1[0])
                 mask2[out_i, h0:h1] = 1.0
 
         self.register_buffer("mask1", mask1, persistent=True)
