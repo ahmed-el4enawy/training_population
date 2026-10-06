@@ -11,6 +11,7 @@ import os
 import time
 import json
 import hashlib
+import copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -23,6 +24,7 @@ from sklearn.preprocessing._data import _handle_zeros_in_scale
 from t1dsim_ai.population_model import CGMOHSUSimStateSpaceModel_V2
 from t1dsim_ai.options import n_neurons_pop
 from t1dsim_ai.utils.preprocess import scale_single_state, scale_inverse_Q1
+from packed_population_model import PackedPopulationModel
 
 # ==============================================================================
 # CONFIG - EDIT THESE
@@ -60,6 +62,29 @@ MAX_VAL_BATCHES_PER_EPOCH = None
 SCALER_FIT_ROWS = None
 CHUNK_SCENARIOS = 2000
 
+# [PAPER-REPORTED / RECONSTRUCTION]
+# The paper reports 323,400 simulated days = 46,200 seven-day traces in the
+# complete development dataset (60/20/20 split), and approximately one million
+# 5-hour sequences used for population training. The generated merged artifact
+# is intentionally left immutable; we deterministically select a paper-scale
+# grouped subset for preprocessing/training instead of regenerating it.
+PAPER_TOTAL_TRACES = 46_200
+PAPER_TRAIN_TRACES = 27_720
+PAPER_VAL_TRACES = 9_240
+PAPER_TEST_TRACES = 9_240
+PAPER_SUBSET_VERSION = 1
+TRAIN_SEQUENCE_LIMIT = 1_000_000
+
+# Algorithm 1 describes final optimization on DP_train. Validation with no
+# overlap is described for Bayesian architecture optimization, not as a
+# mandatory pass after every final-training epoch.
+RUN_VALIDATION_DURING_FINAL_TRAINING = False
+
+# Engineering-only equivalent packing of the ten subnetworks into two masked
+# linear operations per Euler step. Final saved weights are exported back to
+# the official CGMOHSUSimStateSpaceModel_V2 state_dict layout.
+USE_PACKED_MODEL = True
+
 INPUT_COLUMN_PERM = None
 STATE_ORDER = ["Q1", "Q2", "S1", "S2", "I", "X1", "X2", "X3", "C2", "C1"]
 C1_INDEX = STATE_ORDER.index("C1")
@@ -93,15 +118,72 @@ def get_dataset_dims(path):
         n_inputs = f["dataset_inputs"].shape[0]
     return n_scenarios, T, n_states, n_inputs
 
+def _indices_sha256(idx):
+    arr = np.asarray(idx, dtype=np.int64)
+    return hashlib.sha256(arr.tobytes()).hexdigest().upper()
+
+
+def _select_grouped_trace_subset(split_idx, day_ids_all, target_count, seed):
+    """Select whole 7-day meal-scenario groups up to the paper-scale trace count."""
+    split_idx = np.asarray(split_idx, dtype=np.int64)
+    if len(split_idx) <= target_count:
+        return np.sort(split_idx)
+
+    keys = np.sort(day_ids_all[split_idx], axis=1)
+    _, inverse = np.unique(keys, axis=0, return_inverse=True)
+
+    order = np.argsort(inverse, kind="stable")
+    counts = np.bincount(inverse)
+    starts = np.concatenate(([0], np.cumsum(counts)))
+
+    rng = np.random.RandomState(seed)
+    group_order = rng.permutation(len(counts))
+
+    selected_groups = []
+    selected_count = 0
+    for g in group_order:
+        c = int(counts[g])
+        if selected_count + c <= target_count:
+            selected_groups.append(int(g))
+            selected_count += c
+            if selected_count == target_count:
+                break
+
+    if selected_count == 0:
+        raise RuntimeError("Paper-scale group selection produced no traces.")
+
+    selected_parts = []
+    for g in selected_groups:
+        lo, hi = int(starts[g]), int(starts[g + 1])
+        selected_parts.append(split_idx[order[lo:hi]])
+
+    chosen = np.sort(np.concatenate(selected_parts))
+    if target_count - len(chosen) > int(counts.max()):
+        raise RuntimeError(
+            f"Could not form a close grouped subset: target={target_count}, selected={len(chosen)}"
+        )
+    return chosen
+
+
 def get_splits(path, max_train=None, max_val=None):
     with h5py.File(path, "r") as f:
-        split_id = f["dataset_split_id"][()]
-    train_idx = np.where(split_id == 0)[0]
-    val_idx = np.where(split_id == 1)[0]
-    test_idx = np.where(split_id == 2)[0]
-    
-    if max_train is not None: train_idx = train_idx[:max_train]
-    if max_val is not None: val_idx = val_idx[:max_val]
+        split_id = np.asarray(f["dataset_split_id"][()]).reshape(-1)
+        day_ids = np.asarray(f["dataset_day_ids"][()])
+        if day_ids.shape[0] == 7:
+            day_ids = day_ids.T
+
+    train_all = np.where(split_id == 0)[0]
+    val_all = np.where(split_id == 1)[0]
+    test_all = np.where(split_id == 2)[0]
+
+    train_idx = _select_grouped_trace_subset(train_all, day_ids, PAPER_TRAIN_TRACES, SEED + 101)
+    val_idx = _select_grouped_trace_subset(val_all, day_ids, PAPER_VAL_TRACES, SEED + 102)
+    test_idx = _select_grouped_trace_subset(test_all, day_ids, PAPER_TEST_TRACES, SEED + 103)
+
+    if max_train is not None:
+        train_idx = train_idx[:max_train]
+    if max_val is not None:
+        val_idx = val_idx[:max_val]
     return train_idx, val_idx, test_idx
 
 _q1_checked = False
@@ -198,7 +280,7 @@ def transform_in_place_memmap(scaler, memmap_array, prefix, name, chunk_rows=500
 # Framed batch sampler (true 75% overlap, index pairs only)
 # ==============================================================================
 class FramedWindowSampler:
-    def __init__(self, x_est, u_fit, seq_len, overlap, batch_size, device, seed=0):
+    def __init__(self, x_est, u_fit, seq_len, overlap, batch_size, device, seed=0, max_sequences=None):
         self.x_est = x_est
         self.u_fit = u_fit
         self.seq_len = seq_len
@@ -211,8 +293,12 @@ class FramedWindowSampler:
 
         scenario_grid, start_grid = np.meshgrid(np.arange(self.N), starts, indexing="ij")
         self.pairs = np.stack([scenario_grid.ravel(), start_grid.ravel()], axis=1).astype(np.int32)
-        
+
         self.rng = np.random.RandomState(seed)
+        if max_sequences is not None and len(self.pairs) > max_sequences:
+            chosen = self.rng.choice(len(self.pairs), size=int(max_sequences), replace=False)
+            self.pairs = self.pairs[chosen]
+
         self._reshuffle()
 
     def _reshuffle(self):
@@ -324,7 +410,7 @@ class PopulationLoss:
         L_consistency = torch.sum(self.w * per_state_loss)
 
         L_total = L_fit + self.alpha * L_consistency
-        return L_total, L_fit.item(), L_consistency.item()
+        return L_total, L_fit, L_consistency
 
 # ==============================================================================
 # Main
