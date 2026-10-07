@@ -13,7 +13,6 @@ set -euo pipefail
 
 echo "Hostname: $(hostname)"
 echo "Date: $(date)"
-nvidia-smi
 
 export BENCHMARK_ONLY="1"
 /nfs/slurm/cugp012/envs/t1d/bin/python -c "import sys; print('Python version:', sys.version)"

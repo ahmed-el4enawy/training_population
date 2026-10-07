@@ -11,6 +11,7 @@ import os
 import time
 import json
 import hashlib
+import copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -23,6 +24,7 @@ from sklearn.preprocessing._data import _handle_zeros_in_scale
 from t1dsim_ai.population_model import CGMOHSUSimStateSpaceModel_V2
 from t1dsim_ai.options import n_neurons_pop
 from t1dsim_ai.utils.preprocess import scale_single_state, scale_inverse_Q1
+from packed_population_model import PackedPopulationModel
 
 # ==============================================================================
 # CONFIG - EDIT THESE
@@ -60,6 +62,29 @@ MAX_VAL_BATCHES_PER_EPOCH = None
 SCALER_FIT_ROWS = None
 CHUNK_SCENARIOS = 2000
 
+# [PAPER-REPORTED / RECONSTRUCTION]
+# The paper reports 323,400 simulated days = 46,200 seven-day traces in the
+# complete development dataset (60/20/20 split), and approximately one million
+# 5-hour sequences used for population training. The generated merged artifact
+# is intentionally left immutable; we deterministically select a paper-scale
+# grouped subset for preprocessing/training instead of regenerating it.
+PAPER_TOTAL_TRACES = 46_200
+PAPER_TRAIN_TRACES = 27_720
+PAPER_VAL_TRACES = 9_240
+PAPER_TEST_TRACES = 9_240
+PAPER_SUBSET_VERSION = 1
+TRAIN_SEQUENCE_LIMIT = 1_000_000
+
+# Algorithm 1 describes final optimization on DP_train. Validation with no
+# overlap is described for Bayesian architecture optimization, not as a
+# mandatory pass after every final-training epoch.
+RUN_VALIDATION_DURING_FINAL_TRAINING = False
+
+# Engineering-only equivalent packing of the ten subnetworks into two masked
+# linear operations per Euler step. Final saved weights are exported back to
+# the official CGMOHSUSimStateSpaceModel_V2 state_dict layout.
+USE_PACKED_MODEL = True
+
 INPUT_COLUMN_PERM = None
 STATE_ORDER = ["Q1", "Q2", "S1", "S2", "I", "X1", "X2", "X3", "C2", "C1"]
 C1_INDEX = STATE_ORDER.index("C1")
@@ -93,15 +118,72 @@ def get_dataset_dims(path):
         n_inputs = f["dataset_inputs"].shape[0]
     return n_scenarios, T, n_states, n_inputs
 
+def _indices_sha256(idx):
+    arr = np.asarray(idx, dtype=np.int64)
+    return hashlib.sha256(arr.tobytes()).hexdigest().upper()
+
+
+def _select_grouped_trace_subset(split_idx, day_ids_all, target_count, seed):
+    """Select whole 7-day meal-scenario groups up to the paper-scale trace count."""
+    split_idx = np.asarray(split_idx, dtype=np.int64)
+    if len(split_idx) <= target_count:
+        return np.sort(split_idx)
+
+    keys = np.sort(day_ids_all[split_idx], axis=1)
+    _, inverse = np.unique(keys, axis=0, return_inverse=True)
+
+    order = np.argsort(inverse, kind="stable")
+    counts = np.bincount(inverse)
+    starts = np.concatenate(([0], np.cumsum(counts)))
+
+    rng = np.random.RandomState(seed)
+    group_order = rng.permutation(len(counts))
+
+    selected_groups = []
+    selected_count = 0
+    for g in group_order:
+        c = int(counts[g])
+        if selected_count + c <= target_count:
+            selected_groups.append(int(g))
+            selected_count += c
+            if selected_count == target_count:
+                break
+
+    if selected_count == 0:
+        raise RuntimeError("Paper-scale group selection produced no traces.")
+
+    selected_parts = []
+    for g in selected_groups:
+        lo, hi = int(starts[g]), int(starts[g + 1])
+        selected_parts.append(split_idx[order[lo:hi]])
+
+    chosen = np.sort(np.concatenate(selected_parts))
+    if target_count - len(chosen) > int(counts.max()):
+        raise RuntimeError(
+            f"Could not form a close grouped subset: target={target_count}, selected={len(chosen)}"
+        )
+    return chosen
+
+
 def get_splits(path, max_train=None, max_val=None):
     with h5py.File(path, "r") as f:
-        split_id = f["dataset_split_id"][()]
-    train_idx = np.where(split_id == 0)[0]
-    val_idx = np.where(split_id == 1)[0]
-    test_idx = np.where(split_id == 2)[0]
-    
-    if max_train is not None: train_idx = train_idx[:max_train]
-    if max_val is not None: val_idx = val_idx[:max_val]
+        split_id = np.asarray(f["dataset_split_id"][()]).reshape(-1)
+        day_ids = np.asarray(f["dataset_day_ids"][()])
+        if day_ids.shape[0] == 7:
+            day_ids = day_ids.T
+
+    train_all = np.where(split_id == 0)[0]
+    val_all = np.where(split_id == 1)[0]
+    test_all = np.where(split_id == 2)[0]
+
+    train_idx = _select_grouped_trace_subset(train_all, day_ids, PAPER_TRAIN_TRACES, SEED + 101)
+    val_idx = _select_grouped_trace_subset(val_all, day_ids, PAPER_VAL_TRACES, SEED + 102)
+    test_idx = _select_grouped_trace_subset(test_all, day_ids, PAPER_TEST_TRACES, SEED + 103)
+
+    if max_train is not None:
+        train_idx = train_idx[:max_train]
+    if max_val is not None:
+        val_idx = val_idx[:max_val]
     return train_idx, val_idx, test_idx
 
 _q1_checked = False
@@ -198,7 +280,7 @@ def transform_in_place_memmap(scaler, memmap_array, prefix, name, chunk_rows=500
 # Framed batch sampler (true 75% overlap, index pairs only)
 # ==============================================================================
 class FramedWindowSampler:
-    def __init__(self, x_est, u_fit, seq_len, overlap, batch_size, device, seed=0):
+    def __init__(self, x_est, u_fit, seq_len, overlap, batch_size, device, seed=0, max_sequences=None):
         self.x_est = x_est
         self.u_fit = u_fit
         self.seq_len = seq_len
@@ -211,8 +293,12 @@ class FramedWindowSampler:
 
         scenario_grid, start_grid = np.meshgrid(np.arange(self.N), starts, indexing="ij")
         self.pairs = np.stack([scenario_grid.ravel(), start_grid.ravel()], axis=1).astype(np.int32)
-        
+
         self.rng = np.random.RandomState(seed)
+        if max_sequences is not None and len(self.pairs) > max_sequences:
+            chosen = self.rng.choice(len(self.pairs), size=int(max_sequences), replace=False)
+            self.pairs = self.pairs[chosen]
+
         self._reshuffle()
 
     def _reshuffle(self):
@@ -324,7 +410,7 @@ class PopulationLoss:
         L_consistency = torch.sum(self.w * per_state_loss)
 
         L_total = L_fit + self.alpha * L_consistency
-        return L_total, L_fit.item(), L_consistency.item()
+        return L_total, L_fit, L_consistency
 
 # ==============================================================================
 # Main
@@ -382,7 +468,10 @@ def main():
                 raise ValueError("Cache dtype mismatch")
                 
             # 2. Metadata checks
-            if not (manifest.get("CACHE_SCHEMA_VERSION") == 1 and
+            if not (manifest.get("CACHE_SCHEMA_VERSION") == 2 and
+                    manifest.get("paper_subset_version") == PAPER_SUBSET_VERSION and
+                    manifest.get("train_indices_sha256") == _indices_sha256(train_idx) and
+                    manifest.get("val_indices_sha256") == _indices_sha256(val_idx) and
                     manifest.get("train_count") == len(train_idx) and
                     manifest.get("val_count") == len(val_idx) and
                     manifest.get("T") == T and
@@ -502,9 +591,12 @@ def main():
         state_min[C1_INDEX] = (0.0 - scaler_states.center_[C1_INDEX]) / scaler_states.scale_[C1_INDEX]
         
         manifest = {
-            "CACHE_SCHEMA_VERSION": 1,
+            "CACHE_SCHEMA_VERSION": 2,
+            "paper_subset_version": PAPER_SUBSET_VERSION,
             "dataset_sha256": actual_sha256,
             "dataset_size": actual_size,
+            "train_indices_sha256": _indices_sha256(train_idx),
+            "val_indices_sha256": _indices_sha256(val_idx),
             "train_count": len(train_idx),
             "val_count": len(val_idx),
             "T": T,
@@ -555,7 +647,15 @@ def main():
     cgm_max_scaled = None
 
     print(f"Building model on device: {DEVICE}")
-    model = CGMOHSUSimStateSpaceModel_V2(n_feat=n_neurons_pop)
+    official_init_model = CGMOHSUSimStateSpaceModel_V2(n_feat=n_neurons_pop)
+    if USE_PACKED_MODEL:
+        model = PackedPopulationModel(official_init_model, n_neurons_pop)
+        print(
+            f"  packed equivalent model: {model.active_parameter_count()} active parameters "
+            f"(official architecture export enabled)"
+        )
+    else:
+        model = official_init_model
     model.to(DEVICE)
 
     simulator = ForwardEulerSimulatorPop(model, ts=5.0, cgm_min=cgm_min_scaled, cgm_max=cgm_max_scaled).to(DEVICE)
@@ -563,8 +663,17 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=LR_DECAY_PER_EPOCH)
 
-    train_sampler = FramedWindowSampler(x_train, u_train, SEQ_LEN, TRAIN_OVERLAP, BATCH_SIZE, DEVICE, seed=SEED)
-    val_sampler = FramedWindowSampler(x_val, u_val, SEQ_LEN, VAL_OVERLAP, BATCH_SIZE, DEVICE, seed=SEED + 1)
+    train_sampler = FramedWindowSampler(
+        x_train, u_train, SEQ_LEN, TRAIN_OVERLAP, BATCH_SIZE, DEVICE,
+        seed=SEED, max_sequences=TRAIN_SEQUENCE_LIMIT
+    )
+    val_sampler = FramedWindowSampler(
+        x_val, u_val, SEQ_LEN, VAL_OVERLAP, BATCH_SIZE, DEVICE, seed=SEED + 1
+    )
+    print(
+        f"Training sequence pool: {len(train_sampler.pairs):,} "
+        f"(paper reports approximately 1 million 5-hour sequences)"
+    )
     
     iters_per_epoch = train_sampler.n_batches_per_epoch()
     if MAX_TRAIN_BATCHES_PER_EPOCH is not None:
@@ -604,7 +713,7 @@ def main():
         model.train()
         
         bm_model_sd = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        bm_opt_sd = optimizer.state_dict()
+        bm_opt_sd = copy.deepcopy(optimizer.state_dict())
         bm_np_rng = np.random.get_state()
         bm_torch_rng = torch.get_rng_state()
         if DEVICE.type == "cuda": bm_cuda_rng = torch.cuda.get_rng_state()
@@ -613,22 +722,23 @@ def main():
         bm_sampler_pos = train_sampler.pos
         
         for _ in range(5):
+            optimizer.zero_grad(set_to_none=True)
             x0, u_batch, x_true = train_sampler.next_batch()
             x_sim = simulator(x0, u_batch)
             loss, _, _ = loss_fn(x_sim, x_true, lim_inferior_scaled, lim_superior_scaled)
             loss.backward()
-            optimizer.zero_grad()
-            
+            optimizer.step()
+
         if DEVICE.type == "cuda": torch.cuda.synchronize()
         t_bm_start = time.time()
-        
+
         for _ in range(BENCHMARK_BATCHES):
+            optimizer.zero_grad(set_to_none=True)
             x0, u_batch, x_true = train_sampler.next_batch()
             x_sim = simulator(x0, u_batch)
             loss, _, _ = loss_fn(x_sim, x_true, lim_inferior_scaled, lim_superior_scaled)
             loss.backward()
-            # NO OPTIMIZER STEP!
-            optimizer.zero_grad()
+            optimizer.step()
             
         if DEVICE.type == "cuda": torch.cuda.synchronize()
         t_bm_end = time.time()
@@ -638,11 +748,13 @@ def main():
         
         print("GPU name:", torch.cuda.get_device_name(0) if DEVICE.type == "cuda" else "CPU")
         print("Number of timed batches:", BENCHMARK_BATCHES)
-        print(f"Seconds per real training batch: {sec_per_batch:.3f} s")
+        print(f"Seconds per production-like training batch: {sec_per_batch:.3f} s")
         print(f"Estimated training-only time per epoch: {est_train_epoch/3600:.2f} hours")
         print("Training batches per epoch:", iters_per_epoch)
         print("Validation batches per epoch:", val_batches_per_epoch)
-        print(f"Rough estimated 15-epoch training-only time: {(est_train_epoch * 15)/3600:.2f} hours")
+        projected_hours = (est_train_epoch * MAX_EPOCHS) / 3600
+        print(f"Projected {MAX_EPOCHS}-epoch training-only time: {projected_hours:.2f} hours")
+        print(f"72-hour target margin: {72.0 - projected_hours:.2f} hours")
         
         model.load_state_dict(bm_model_sd)
         optimizer.load_state_dict(bm_opt_sd)
@@ -655,79 +767,89 @@ def main():
         print("BENCHMARK_ONLY finished. State restored. Exiting.")
         return
 
-    val_fixed_batches = val_sampler.get_fixed_subset(val_batches_per_epoch)
+    val_fixed_batches = (
+        val_sampler.get_fixed_subset(val_batches_per_epoch)
+        if RUN_VALIDATION_DURING_FINAL_TRAINING else []
+    )
 
     for epoch in range(start_epoch, MAX_EPOCHS + 1):
         model.train()
-        epoch_losses = []
+        epoch_loss_sum = torch.zeros((), dtype=torch.float32, device=DEVICE)
         t_epoch = time.time()
         print_every = max(1, min(50, iters_per_epoch // 10))
 
         for it in range(iters_per_epoch):
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             x0, u_batch, x_true = train_sampler.next_batch()
             x_sim = simulator(x0, u_batch)
-
-            if not torch.isfinite(x_sim).all():
-                raise RuntimeError("Non-finite simulation detected during final training.")
-
             loss, _, _ = loss_fn(x_sim, x_true, lim_inferior_scaled, lim_superior_scaled)
-            if not torch.isfinite(loss):
-                raise RuntimeError("Non-finite loss detected during final training.")
-                
             loss.backward()
-            
-            for p in model.parameters():
-                if p.grad is not None and not torch.isfinite(p.grad).all():
-                    raise RuntimeError("Non-finite gradient detected during final training.")
-                
+
+            # One synchronized finite check every 100 steps avoids dozens of
+            # per-parameter GPU synchronizations while still failing early.
+            if it % 100 == 0:
+                grad_tensors = [p.grad.reshape(-1) for p in model.parameters() if p.grad is not None]
+                finite = torch.isfinite(x_sim).all() & torch.isfinite(loss)
+                if grad_tensors:
+                    finite = finite & torch.isfinite(torch.cat(grad_tensors)).all()
+                if not bool(finite.item()):
+                    raise RuntimeError("Non-finite simulation/loss/gradient detected during final training.")
+
             optimizer.step()
-            epoch_losses.append(loss.item())
+            epoch_loss_sum.add_(loss.detach())
 
             if (it + 1) % print_every == 0 or (it + 1) == iters_per_epoch:
-                running_mean = np.mean(epoch_losses) if epoch_losses else float("nan")
+                running_mean = float((epoch_loss_sum / (it + 1)).item())
                 elapsed = time.time() - t_epoch
                 eta = elapsed / (it + 1) * iters_per_epoch
                 print(f"  epoch {epoch} [train {it+1}/{iters_per_epoch}] "
                       f"loss {running_mean:.6f} | elapsed {elapsed:.1f}s | estimated epoch training time {eta:.1f}s")
 
         scheduler.step()
-        model.eval()
-        with torch.no_grad():
-            val_losses = []
-            sq_err_sum = 0.0
-            n_err_vals = 0
-            for v_it, pair_batch in enumerate(val_fixed_batches):
-                x0, u_batch, x_true = val_sampler.batch_from_pairs(pair_batch)
-                x_sim = simulator(x0, u_batch)
-                if torch.isnan(x_sim).any() or torch.isinf(x_sim).any():
-                    continue
-                    
-                loss, _, _ = loss_fn(x_sim, x_true, lim_inferior_scaled, lim_superior_scaled)
-                val_losses.append(loss.item())
+        mean_train_loss = float(epoch_loss_sum.item() / max(1, iters_per_epoch))
 
-                y_sim_mgdl = scale_inverse_Q1(x_sim[1:, :, [0]].cpu().numpy(), OUTPUT_DIR)
-                y_true_mgdl = scale_inverse_Q1(x_true[1:, :, [0]].cpu().numpy(), OUTPUT_DIR)
-                batch_sq_err = (y_sim_mgdl - y_true_mgdl) ** 2
-                sq_err_sum += batch_sq_err.sum()
-                n_err_vals += batch_sq_err.size
+        if RUN_VALIDATION_DURING_FINAL_TRAINING:
+            model.eval()
+            with torch.no_grad():
+                val_losses = []
+                sq_err_sum = 0.0
+                n_err_vals = 0
+                for v_it, pair_batch in enumerate(val_fixed_batches):
+                    x0, u_batch, x_true = val_sampler.batch_from_pairs(pair_batch)
+                    x_sim = simulator(x0, u_batch)
+                    if not torch.isfinite(x_sim).all():
+                        continue
 
-        mean_train_loss = np.mean(epoch_losses) if epoch_losses else float("nan")
-        mean_val_loss = np.mean(val_losses) if val_losses else float("nan")
-        rmse_mgdl = np.sqrt(sq_err_sum / n_err_vals) if n_err_vals > 0 else float("nan")
+                    loss, _, _ = loss_fn(x_sim, x_true, lim_inferior_scaled, lim_superior_scaled)
+                    val_losses.append(loss.item())
 
-        print(f"Epoch {epoch:4d} | train_loss {mean_train_loss:.6f} | val_loss {mean_val_loss:.6f} | "
-              f"val_RMSE {rmse_mgdl:.2f} mg/dL | lr {optimizer.param_groups[0]['lr']:.2e} | "
-              f"time {time.time()-t_epoch:.1f}s")
+                    y_sim_mgdl = scale_inverse_Q1(x_sim[1:, :, [0]].cpu().numpy(), OUTPUT_DIR)
+                    y_true_mgdl = scale_inverse_Q1(x_true[1:, :, [0]].cpu().numpy(), OUTPUT_DIR)
+                    batch_sq_err = (y_sim_mgdl - y_true_mgdl) ** 2
+                    sq_err_sum += batch_sq_err.sum()
+                    n_err_vals += batch_sq_err.size
 
-        if mean_val_loss < best_val_loss:
-            best_val_loss = mean_val_loss
-            epochs_without_improvement = 0
+            mean_val_loss = np.mean(val_losses) if val_losses else float("nan")
+            rmse_mgdl = np.sqrt(sq_err_sum / n_err_vals) if n_err_vals > 0 else float("nan")
+            print(
+                f"Epoch {epoch:4d} | train_loss {mean_train_loss:.6f} | "
+                f"val_loss {mean_val_loss:.6f} | val_RMSE {rmse_mgdl:.2f} mg/dL | "
+                f"lr {optimizer.param_groups[0]['lr']:.2e} | time {time.time()-t_epoch:.1f}s"
+            )
+
+            if mean_val_loss < best_val_loss:
+                best_val_loss = mean_val_loss
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if PATIENCE is not None and epochs_without_improvement >= PATIENCE:
+                    print(f"Early stopping after {epochs_without_improvement} epochs.")
+                    break
         else:
-            epochs_without_improvement += 1
-            if PATIENCE is not None and epochs_without_improvement >= PATIENCE:
-                print(f"Early stopping after {epochs_without_improvement} epochs.")
-                break
+            print(
+                f"Epoch {epoch:4d} | train_loss {mean_train_loss:.6f} | "
+                f"lr {optimizer.param_groups[0]['lr']:.2e} | time {time.time()-t_epoch:.1f}s"
+            )
                 
         ckpt = {
             'completed_epoch': epoch,
@@ -749,12 +871,19 @@ def main():
         os.replace(tmp_ckpt_path, ckpt_path)
         print(f"  -> saved resumable training state to {ckpt_path}")
 
-        if CHECKPOINT_POLICY == "final_epoch" or (CHECKPOINT_POLICY == "best_validation" and epochs_without_improvement == 0):
+        if CHECKPOINT_POLICY == "final_epoch" or (
+            CHECKPOINT_POLICY == "best_validation" and epochs_without_improvement == 0
+        ):
             model_out_path = os.path.join(OUTPUT_DIR, MODEL_FILENAME)
             tmp_model_path = model_out_path + ".tmp"
-            torch.save(model.state_dict(), tmp_model_path)
+            export_sd = (
+                model.export_official_state_dict()
+                if isinstance(model, PackedPopulationModel)
+                else {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            )
+            torch.save(export_sd, tmp_model_path)
             os.replace(tmp_model_path, model_out_path)
-            print(f"  -> saved final_epoch checkpoint to {model_out_path}")
+            print(f"  -> saved official-layout checkpoint to {model_out_path}")
 
     print(f"Training complete.")
 
