@@ -424,9 +424,9 @@ def train(
     print(f"\nTraining set:   {n_train_traj:,} trajectories ({train_rows:,} timesteps)")
     print(f"Validation set: {n_val_traj:,} trajectories ({val_rows:,} timesteps)")
 
-    # Compute physical boundaries
+    # Compute physical boundaries (Eq. 7 clinical thresholds: hypo < 70, hyper > 250 mg/dL)
     lim_inferior_scaled = float((70.0 - scaler_states.center_[0]) / scaler_states.scale_[0])
-    lim_superior_scaled = float((180.0 - scaler_states.center_[0]) / scaler_states.scale_[0])
+    lim_superior_scaled = float((250.0 - scaler_states.center_[0]) / scaler_states.scale_[0])
     cgm_min_scaled = float((39.0 - scaler_states.center_[0]) / scaler_states.scale_[0])
     cgm_max_scaled = float((401.0 - scaler_states.center_[0]) / scaler_states.scale_[0])
 

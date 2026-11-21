@@ -125,6 +125,17 @@ class TestTrainingPipeline(unittest.TestCase):
         penalty_hyper = loss_fn.fit_penalty(y_sim_hyper, y_true_hyper, lim_inferior=0.0, lim_superior=2.0)
         self.assertEqual(penalty_hyper.item(), 6.0)
 
+    def test_physical_boundary_thresholds(self):
+        # Verify Eq. 7 clinical penalty thresholds (70 mg/dL hypo, 250 mg/dL severe hyper)
+        # Scaler dummy values: center = 200.0, scale = 80.0
+        center_0 = 200.0
+        scale_0 = 80.0
+        lim_inf_scaled = float((70.0 - center_0) / scale_0)
+        lim_sup_scaled = float((250.0 - center_0) / scale_0)
+        self.assertAlmostEqual(lim_inf_scaled, -1.625)
+        self.assertAlmostEqual(lim_sup_scaled, 0.625)
+        self.assertGreater(lim_sup_scaled, lim_inf_scaled)
+
     def test_checkpoint_saving_and_resumption(self):
         temp_dir = tempfile.mkdtemp(prefix="test_ckpt_")
         try:
