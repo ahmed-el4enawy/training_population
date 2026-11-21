@@ -33,7 +33,7 @@ import scipy.stats as st
 # ==============================================================================
 # CONFIGURATION & REPRODUCIBILITY
 # ==============================================================================
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parent.parent
 PROJECT_ROOT = REPO_ROOT.parent
 
 # Paths strictly within training_population and GeneratedDataset
@@ -41,9 +41,10 @@ TEST_DATA_DIR = PROJECT_ROOT / "CodeForGeneratingDataset" / "GeneratedDataset" /
 CHECKPOINT_PATH = REPO_ROOT / "models" / "PopulationModel" / "population_model_05022024_epoch_15.pt"
 SCALER_INPUTS_PATH = REPO_ROOT / "models" / "PopulationModel" / "scaler_inputs.pkl"
 SCALER_STATES_PATH = REPO_ROOT / "models" / "PopulationModel" / "scaler_states.pkl"
-JSON_OUTPUT_PATH = REPO_ROOT / "SIM002_TEST_EVALUATION_RESULTS.json"
-REPORT_OUTPUT_PATH = REPO_ROOT / "SIM002_TEST_EVALUATION_REPORT.md"
-LOG_OUTPUT_PATH = REPO_ROOT / "SIM002_TEST_EVALUATION_EXECUTION.log"
+REPORTS_DIR = REPO_ROOT / "reports" / "sim002_test"
+JSON_OUTPUT_PATH = REPORTS_DIR / "SIM002_TEST_EVALUATION_RESULTS.json"
+REPORT_OUTPUT_PATH = REPORTS_DIR / "SIM002_TEST_EVALUATION_REPORT.md"
+LOG_OUTPUT_PATH = REPORTS_DIR / "SIM002_TEST_EVALUATION_EXECUTION.log"
 
 EXPECTED_SUBJECTS = ["042006", "042007", "042011", "042012", "042013"]
 EXPECTED_FILES = 75

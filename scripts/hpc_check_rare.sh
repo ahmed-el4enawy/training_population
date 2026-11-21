@@ -13,4 +13,4 @@ set -euo pipefail
 echo "Hostname: $(hostname)"
 echo "Date: $(date)"
 
-/nfs/slurm/cugp012/envs/t1d/bin/python -u check_rare_subset.py --dataset=/tmp/cugp012/population_development_dataset_merged.mat
+/nfs/slurm/cugp012/envs/t1d/bin/python -u scripts/check_rare_subset.py --dataset=/tmp/cugp012/population_development_dataset_merged.mat

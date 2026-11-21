@@ -2,7 +2,7 @@
 
 **Model Artifact:** `population_model_05022024_epoch_15.pt`  
 **Evaluation Date:** 2026-11-21 20:02:31  
-**Evaluation Pipeline:** Standalone Vectorized Forward Euler Adapter (`evaluate_sim002_test_adapter.py`)  
+**Evaluation Pipeline:** Standalone Vectorized Forward Euler Adapter (`scripts/evaluate_sim002_test_adapter.py`)  
 
 ---
 

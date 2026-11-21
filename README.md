@@ -22,7 +22,7 @@ This repository contains the training and evaluation pipeline for the population
 - **Mathematical Simulation**:
   - Forward Euler numerical integration with step $\Delta t = 5.0\text{ min}$.
 - **Physiological Loss Function (Eq. 5–9)**:
-  - Asymmetric penalty: $2\times$ multiplier for under-predicting hypoglycemia ($\le 70\text{ mg/dL}$), $6\times$ multiplier for over-predicting hyperglycemia ($\ge 180\text{ mg/dL}$).
+  - Asymmetric penalty: $2\times$ multiplier for under-predicting hypoglycemia ($\le 70\text{ mg/dL}$), $6\times$ multiplier for over-predicting hyperglycemia ($\ge 250\text{ mg/dL}$).
   - State consistency penalty: $\alpha = 0.7$, state weights $w = [5/24, 1/6, 1/12, 1/12, 1/12, 1/12, 1/12, 1/12, 1/12, 1/24]$ with $C_1$ masked out.
   - Soft barrier constraint: $\beta = 0.08$ penalizing states below empirical physical floor.
 - **Hyperparameters (Paper Explicit)**:
@@ -121,4 +121,32 @@ sbatch hpc_train.sh
 
 # 4. Resume interrupted training
 sbatch --export=ALL,RESUME_CHECKPOINT=/nfs/slurm/cugp012/training_population/models/PopulationModel_v2/training_state_latest.pt hpc_train.sh
+```
+
+---
+
+## Repository Structure
+
+```text
+training_population/
+├── dataset_pipeline.py          # Data ingestion, subject split isolation & streaming cache builder
+├── train_population_model.py    # Main population neural model training & benchmark CLI
+├── packed_population_model.py   # CUDA-optimized equivalent model architecture
+├── evaluate_population_model.py # SIM002 TEST clinical metric & TOST evaluation CLI
+├── hpc_train.sh                 # Production Slurm training script (gpu5 partition)
+├── hpc_benchmark.sh             # Slurm throughput benchmarking script
+├── hpc_prepare_cache.sh         # Slurm pre-caching script
+├── models/
+│   └── PopulationModel/         # Trained weights & official RobustScaler artifacts
+├── tests/                       # Complete unit and integration test suite (19 tests)
+├── scripts/                     # Standalone verification, evaluation, and reference tools
+│   ├── evaluate_sim002_test_adapter.py
+│   ├── read_dataset.py
+│   ├── merge_parts.py
+│   ├── check_rare_subset.py
+│   └── hpc_check_rare.sh
+├── reports/                     # Audit, verification, and evaluation evidence
+│   ├── dataset_integrity/       # Full 5,010-file census audit report and JSON results
+│   └── sim002_test/             # Held-out SIM002 TEST clinical evaluation report & reference PDF
+└── T1DSim_AI/                   # Official T1DSim Python library submodule
 ```

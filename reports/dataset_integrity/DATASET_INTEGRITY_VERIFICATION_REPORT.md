@@ -4,7 +4,7 @@
 **Training Repository:** `F:\College\Graduation Project\training_population`  
 **Verification Date:** 2026-11-21  
 **Scope of Verification:** 100% Census Audit across all **5,010 `.pkl` files**  
-**Machine-Readable Audit Results:** [`DATASET_INTEGRITY_VERIFICATION_RESULTS.json`](file:///F:/College/Graduation%20Project/training_population/DATASET_INTEGRITY_VERIFICATION_RESULTS.json)
+**Machine-Readable Audit Results:** [`DATASET_INTEGRITY_VERIFICATION_RESULTS.json`](file:///F:/College/Graduation%20Project/training_population/reports/dataset_integrity/DATASET_INTEGRITY_VERIFICATION_RESULTS.json)
 
 ---
 
