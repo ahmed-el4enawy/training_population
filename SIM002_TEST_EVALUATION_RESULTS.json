@@ -1,0 +1,117 @@
+{
+  "metadata": {
+    "model_checkpoint": "population_model_05022024_epoch_15.pt",
+    "test_files_count": 75,
+    "trajectories_count": 825,
+    "windows_count": 27225,
+    "seq_len": 61,
+    "hop": 60,
+    "execution_time_sec": 4.89,
+    "subjects": [
+      "042006",
+      "042007",
+      "042011",
+      "042012",
+      "042013"
+    ]
+  },
+  "window_level_tost": {
+    "TIR": {
+      "paper_reference": "72.9 +/- 35.2 %",
+      "local_ode_mean": 73.73,
+      "local_ode_sd": 34.37,
+      "nn_twin_mean": 62.73,
+      "nn_twin_sd": 35.37,
+      "margin": 5.0,
+      "tost_p_value": 1.0,
+      "equivalent": false
+    },
+    "TAR": {
+      "paper_reference": "23.1 +/- 36.3 %",
+      "local_ode_mean": 22.61,
+      "local_ode_sd": 35.67,
+      "nn_twin_mean": 28.99,
+      "nn_twin_sd": 35.6,
+      "margin": 5.0,
+      "tost_p_value": 1.0,
+      "equivalent": false
+    },
+    "TBR": {
+      "paper_reference": "4.0 +/- 8.2 %",
+      "local_ode_mean": 3.67,
+      "local_ode_sd": 6.83,
+      "nn_twin_mean": 8.28,
+      "nn_twin_sd": 18.47,
+      "margin": 1.0,
+      "tost_p_value": 1.0,
+      "equivalent": false
+    },
+    "LBGI": {
+      "paper_reference": "1.5 +/- 1.7 ",
+      "local_ode_mean": 1.38,
+      "local_ode_sd": 1.55,
+      "nn_twin_mean": 19.01,
+      "nn_twin_sd": 63.81,
+      "margin": 0.5,
+      "tost_p_value": 1.0,
+      "equivalent": false
+    },
+    "HBGI": {
+      "paper_reference": "4.2 +/- 6.2 ",
+      "local_ode_mean": 4.11,
+      "local_ode_sd": 5.99,
+      "nn_twin_mean": 11.38,
+      "nn_twin_sd": 16.41,
+      "margin": 1.0,
+      "tost_p_value": 1.0,
+      "equivalent": false
+    },
+    "MG": {
+      "paper_reference": "132.6 +/- 48.2 mg/dL",
+      "local_ode_mean": 132.86,
+      "local_ode_sd": 46.85,
+      "nn_twin_mean": 177.13,
+      "nn_twin_sd": 88.22,
+      "margin": 10.0,
+      "tost_p_value": 1.0,
+      "equivalent": false
+    }
+  },
+  "cluster_subject_summary": {
+    "042006": {
+      "n_windows": 5445,
+      "ode_tir_mean": 76.89,
+      "nn_tir_mean": 62.36,
+      "ode_mg_mean": 133.1,
+      "nn_mg_mean": 159.22
+    },
+    "042007": {
+      "n_windows": 5445,
+      "ode_tir_mean": 71.67,
+      "nn_tir_mean": 63.15,
+      "ode_mg_mean": 134.74,
+      "nn_mg_mean": 180.94
+    },
+    "042011": {
+      "n_windows": 5445,
+      "ode_tir_mean": 75.32,
+      "nn_tir_mean": 67.27,
+      "ode_mg_mean": 133.02,
+      "nn_mg_mean": 180.1
+    },
+    "042012": {
+      "n_windows": 5445,
+      "ode_tir_mean": 71.47,
+      "nn_tir_mean": 59.54,
+      "ode_mg_mean": 128.4,
+      "nn_mg_mean": 187.39
+    },
+    "042013": {
+      "n_windows": 5445,
+      "ode_tir_mean": 73.29,
+      "nn_tir_mean": 61.33,
+      "ode_mg_mean": 135.01,
+      "nn_mg_mean": 178.02
+    }
+  }
+}

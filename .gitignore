@@ -23,3 +23,7 @@ models/PopulationModel_v2/
 *.dat
 *.mat
 *.tmp
+training_state_*.pt
+GeneratedDataset/
+EVALUATION_RESULTS.json
+EVALUATION_REPORT.md
