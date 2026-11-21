@@ -22,4 +22,4 @@ if [ -n "${RESUME_CHECKPOINT:-}" ]; then
     echo "Resuming from checkpoint: ${RESUME_CHECKPOINT}"
 fi
 
-/nfs/slurm/cugp012/envs/t1d/bin/python -u train_population_model.py
+/nfs/slurm/cugp012/envs/t1d/bin/python -u train_population_model.py "$@"
